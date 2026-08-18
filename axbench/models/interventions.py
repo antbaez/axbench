@@ -1018,9 +1018,51 @@ class PreferenceNodireftIntervention(
 
         # Calculate the final output
         output = base + diff
-        
+
         return InterventionOutput(
             output=self.dropout(output.to(base.dtype)),
             latent=[diff]
         )
+
+
+class PositionwiseAdditionIntervention(
+    SourcelessIntervention,
+    TrainableIntervention,
+    DistributedRepresentationIntervention
+):
+    """
+    End-aligned, prefill-only steering: v_0 is added to the final prompt token,
+    v_1 to the token before it, and so on for num_positions positions.
+
+    Weights are [n_concepts, num_positions, embed_dim] rather than the
+    [n_concepts, embed_dim] that AdditionIntervention broadcasts over every position.
+
+    Note on prefill detection: AxBench calls generate() with unit_locations=None, which
+    makes pyvene skip its intervene_on_prompt gate entirely, so this hook fires on the
+    prompt *and* on every generated token. We keep steering to the prompt by checking
+    the sequence length: the prefill pass sees the whole prompt, every decode step sees
+    exactly one token (KV cache). This is stateless, so it stays correct across the
+    batch loop in predict_steer, unlike a call counter that would need resetting.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs, keep_last_dim=True)
+        self.num_positions = kwargs["num_positions"]
+        self.proj_weight = nn.Parameter(torch.zeros(
+            kwargs["low_rank_dimension"], self.num_positions, self.embed_dim))
+
+    def forward(self, base, source=None, subspaces=None):
+        if base.shape[1] <= 1:
+            return base  # decode step: leave generation unsteered
+
+        v = self.proj_weight[subspaces["idx"]]  # bs, num_positions, h
+        scale = subspaces["max_act"].unsqueeze(dim=-1).unsqueeze(dim=-1) * \
+            subspaces["mag"].unsqueeze(dim=-1).unsqueeze(dim=-1)
+        n = min(self.num_positions, base.shape[1])
+
+        # generation input is left-padded, so the last prompt token is column -1 for
+        # every row; flip so v_0 lands there and v_k lands k columns earlier.
+        steering_vec = torch.flip(v[:, :n], dims=[1]) * scale
+        delta = torch.zeros_like(base)
+        delta[:, -n:] = steering_vec.to(base.dtype)
+        return base + delta
 

@@ -80,6 +80,9 @@ class ModelParams:
     hypernet_name_or_path: Optional[str] = None
     hypernet_initialize_from_pretrained: Optional[bool] = True
     num_hidden_layers: Optional[int] = None
+    # used by the left-padded DiffMean variants (mean.py); ignored by every other method
+    num_positions: Optional[int] = None
+    max_seq_length: Optional[int] = None
 
 class TrainingArgs:
     def __init__(
@@ -126,7 +129,8 @@ class TrainingArgs:
             'train_on_negative', 'use_synergy', 'bow_penalty', 'bow_C', 'loss_type', 'beta', 'gemma', 
             'reference_free', 'label_smoothing', 'steering_factors', 'negative_only', 'simpo_scaler', 
             'intervention_positions_dropout', 'dropout', 'preference_pairs', 'steering_prompt_type',
-            'hypernet_name_or_path', 'hypernet_initialize_from_pretrained', "num_hidden_layers"
+            'hypernet_name_or_path', 'hypernet_initialize_from_pretrained', "num_hidden_layers",
+            'num_positions', 'max_seq_length'
         ]
         all_params = global_params + hierarchical_params
 
@@ -259,8 +263,9 @@ class TrainingArgs:
     def _infer_type(param_name: str):
         bool_params = ['use_bf16', 'exclude_bos', 'binarize_dataset', 'train_on_negative', 
                        'use_synergy', 'use_dpo_loss', 'use_wandb', 'reference_free', 'negative_only']
-        int_params = ['layer', 'batch_size', 'n_epochs', 'topk', 'seed', 'low_rank_dimension', 
-                      'gradient_accumulation_steps', 'lora_alpha', 'max_concepts', 'max_num_of_examples', 'output_length']
+        int_params = ['layer', 'batch_size', 'n_epochs', 'topk', 'seed', 'low_rank_dimension',
+                      'gradient_accumulation_steps', 'lora_alpha', 'max_concepts', 'max_num_of_examples', 'output_length',
+                      'num_positions', 'max_seq_length']
         float_params = [
             'lr', 'coeff_l1_loss_null', 'coeff_l1_loss', 'coeff_l2_loss', 'coeff_norm_loss', 
             'coeff_latent_l1_loss', 'weight_decay', 'temperature_start', 'temperature_end', 
