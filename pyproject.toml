@@ -23,6 +23,7 @@ dependencies = [
     "altair>=5.5.0",
     "umap-learn>=0.5.7",
     "hf-transfer>=0.1.9",
+    "stanza>=1.14.0",
 ]
 
 [build-system]
