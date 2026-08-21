@@ -651,21 +651,21 @@ class DiffMeanPositional(MeanTokenDiffMean):
             "positional": self.positional_weight.data.cpu().unsqueeze(0),   # 1, num_positions, h
         }
         if weight_file.exists():
-            previous = torch.load(weight_file)
+            previous = torch.load(weight_file, weights_only=True)
             weight = {k: torch.cat([previous[k], v], dim=0) for k, v in weight.items()}
         torch.save(weight, weight_file)
 
         bias_file = dump_dir / f"{model_name}_bias.pt"
         bias = self.ax.proj.bias.data.cpu()
         if bias_file.exists():
-            bias = torch.cat([torch.load(bias_file), bias], dim=0)
+            bias = torch.cat([torch.load(bias_file, weights_only=True), bias], dim=0)
         torch.save(bias, bias_file)
 
     def load(self, dump_dir=None, **kwargs):
         model_name = kwargs.get("model_name", self.__str__())
         print(f"Loading {model_name} from {dump_dir}.")
         weight = torch.load(
-            f"{dump_dir}/{model_name}_weight.pt", map_location=torch.device("cpu"))
+            f"{dump_dir}/{model_name}_weight.pt", map_location=torch.device("cpu"), weights_only=True)
         if kwargs.get("mode") == "steering":
             # derive both dims from the checkpoint so train and inference cannot disagree
             kwargs["low_rank_dimension"] = weight["positional"].shape[0]
@@ -674,7 +674,7 @@ class DiffMeanPositional(MeanTokenDiffMean):
             self.ax.proj_weight.data = weight["positional"].to(self.device)
         else:
             bias = torch.load(
-                f"{dump_dir}/{model_name}_bias.pt", map_location=torch.device("cpu"))
+                f"{dump_dir}/{model_name}_bias.pt", map_location=torch.device("cpu"), weights_only=True)
             kwargs["low_rank_dimension"] = weight["collapsed"].shape[0]
             self.make_model(**kwargs)
             self.ax.proj.weight.data = weight["collapsed"].to(self.device)

@@ -350,6 +350,7 @@ def main():
     # Add the handler to the logger
     if not logger.handlers:
         logger.addHandler(console_handler)
+    logger.propagate = False  # avoid double-printing via the root logger's own handler
 
     # Optionally, create a file handler per rank
     """
@@ -492,7 +493,7 @@ def main():
                 train_on_negative=args.models[model_name].train_on_negative,
                 use_dpo_loss=args.use_dpo_loss,
                 is_chat_model=is_chat_model,
-                output_length=int(args.output_length),
+                output_length=generate_args.output_length,
                 model_name=args.model_name,
                 max_num_of_examples=args.max_num_of_examples,
                 steering_prompt_type=args.models[model_name].steering_prompt_type,
@@ -564,7 +565,7 @@ def main():
             if not sae_files_existing:
                 logger.warning(f"No SAE files found for model {model_name}. Skipping.")
             else:
-                sae_weights = [torch.load(f) for f in sae_files_existing]
+                sae_weights = [torch.load(f, weights_only=True) for f in sae_files_existing]
                 combined_sae_params = {
                     "b_dec": sae_weights[0]["b_dec"],
                     "W_dec": [],
@@ -615,8 +616,8 @@ def main():
                 continue
 
             # Load weights and biases
-            weights = [torch.load(f) for f in weight_files_existing]
-            biases = [torch.load(f) for f in bias_files_existing]
+            weights = [torch.load(f, weights_only=True) for f in weight_files_existing]
+            biases = [torch.load(f, weights_only=True) for f in bias_files_existing]
 
             # Concatenate weights and biases
             if isinstance(weights[0], dict):

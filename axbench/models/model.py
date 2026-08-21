@@ -100,13 +100,13 @@ class Model(BaseModel):
         weight_file = dump_dir / f"{model_name}_weight.pt"
         weight = self.ax.proj.weight.data.cpu()
         if weight_file.exists():
-            weight = torch.cat([torch.load(weight_file), weight], dim=0)
+            weight = torch.cat([torch.load(weight_file, weights_only=True), weight], dim=0)
         torch.save(weight, weight_file)
-        
+
         bias_file = dump_dir / f"{model_name}_bias.pt"
         bias = self.ax.proj.bias.data.cpu()
         if bias_file.exists():
-            bias = torch.cat([torch.load(bias_file), bias], dim=0)
+            bias = torch.cat([torch.load(bias_file, weights_only=True), bias], dim=0)
         torch.save(bias, bias_file)
 
     def load(self, dump_dir=None, **kwargs):
@@ -119,12 +119,14 @@ class Model(BaseModel):
             weight = torch.load(
                 f"{dump_dir}/{model_name}_weight.pt",
                 map_location=torch.device("cpu"),
-                mmap=True  # Enable memory mapping
+                mmap=True,  # Enable memory mapping
+                weights_only=True
             )
             bias = torch.load(
                 f"{dump_dir}/{model_name}_bias.pt",
                 map_location=torch.device("cpu"),
-                mmap=True  # Enable memory mapping
+                mmap=True,  # Enable memory mapping
+                weights_only=True
             )
             weight_rank_1 = weight[concept_id].unsqueeze(0)
             bias_rank_1 = bias[concept_id].unsqueeze(0)
@@ -139,10 +141,12 @@ class Model(BaseModel):
             weight = torch.load(
                 f"{dump_dir}/{model_name}_weight.pt",
                 map_location=torch.device("cpu"),
+                weights_only=True
             )
             bias = torch.load(
                 f"{dump_dir}/{model_name}_bias.pt",
                 map_location=torch.device("cpu"),
+                weights_only=True
             )
             # override low_rank_dimension in kwargs
             kwargs["low_rank_dimension"] = weight.shape[0]
