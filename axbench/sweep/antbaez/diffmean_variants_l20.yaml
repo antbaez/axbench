@@ -17,24 +17,24 @@ train:
   models:
     # kept as the reference point: right-padded, unchanged from no_grad.yaml
     DiffMean:
-      batch_size: 6
+      batch_size: 24
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
     # left-padded equivalent of DiffMean; should match it within bf16 noise
     MeanTokenDiffMean:
-      batch_size: 6
+      batch_size: 24
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
       # max_seq_length: 256   # uncomment to cap padding width (see cost note)
     LastTokenDiffMean:
-      batch_size: 6
+      batch_size: 24
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
     DiffMeanPositional:
-      batch_size: 6
+      batch_size: 24
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
