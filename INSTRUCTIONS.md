@@ -66,3 +66,10 @@ uv run axbench/scripts/evaluate.py \
   --dump_dir axbench/results \
   --mode steering_test
 ```
+
+```bash
+uv run axbench/scripts/evaluate.py \
+  --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
+  --dump_dir axbench/results \
+  --mode steering
+```

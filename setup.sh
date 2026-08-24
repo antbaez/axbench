@@ -11,3 +11,6 @@ cd axbench/data
 bash download-2b.sh
 bash download-9b.sh
 bash download-alpaca.sh
+
+cd ../..
+uv run download_from_hf.py

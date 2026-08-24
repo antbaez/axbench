@@ -37,9 +37,6 @@ logging.basicConfig(format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)
     level=logging.WARN)
 logger = logging.getLogger(__name__)
 
-# using pyreft out-of-the-box
-import pyreft
-
 
 def load_metadata_flatten(metadata_path):
     """

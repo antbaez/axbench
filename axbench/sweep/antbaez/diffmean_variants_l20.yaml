@@ -51,7 +51,7 @@ inference:
   steering_intervention_type: "addition" # clamping
   steering_model_name: "google/gemma-2-9b-it"
   steering_datasets: ["AlpacaEval"]
-  steering_batch_size: 70
+  steering_batch_size: 140
   steering_output_length: 128
   steering_layers: [20]
   steering_num_of_examples: 10 # number of examples per concept and per factor
