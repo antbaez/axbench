@@ -69,7 +69,6 @@ evaluate:
     "HardNegativeEvaluator",
   ]
   steering_evaluators: [
-    "PerplexityEvaluator",
     "LMJudgeEvaluator",
   ]
   winrate_split_ratio: 0.5 # this is for steering only, we use a separate partition for factor selection.

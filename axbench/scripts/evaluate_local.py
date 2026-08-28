@@ -7,7 +7,9 @@
 #     python axbench/scripts/evaluate_local.py --config axbench/demo/sweep/evaluate.yaml --mode steering
 
 import shutil
+import itertools
 from axbench.models.local_judge import LocalLanguageModel
+from axbench.evaluators.lm_judge_local import LMJudgeEvaluator as LocalLMJudgeEvaluator
 import ast
 import os, argparse, yaml, json, glob, pickle, tempfile, copy
 import pandas as pd
@@ -357,7 +359,13 @@ def eval_steering_single_task_local(args_tuple, local_lm):
     # `lm_model` is the (unused here) model-name string from args.lm_model --
     # every task shares the one already-loaded `local_lm` engine instead.
 
-    evaluator_class = getattr(axbench, evaluator_name)
+    # LMJudgeEvaluator is resolved to the local vLLM-batching variant here
+    # instead of axbench.LMJudgeEvaluator (lm_judge.py), which stays the
+    # OpenAI-path evaluator used unmodified by evaluate.py.
+    if evaluator_name == "LMJudgeEvaluator":
+        evaluator_class = LocalLMJudgeEvaluator
+    else:
+        evaluator_class = getattr(axbench, evaluator_name)
     ### accomodate for rule special cases that need stanza
     if "Rule" in evaluator_name and current_df['input_concept'].iloc[0] in NEED_STANZA:
         evaluator = evaluator_class(
@@ -385,13 +393,21 @@ def eval_steering(args):
     data_dir = args.data_dir
     dump_dir = args.dump_dir
 
+    # When --chunk is set, every output file (state pickle, .jsonl, .parquet,
+    # temp pickles) is tagged so N concurrent chunk processes never share a
+    # write target -- see --merge_chunks for recombining them afterward.
+    output_tag = f"{args.mode}_chunk{args.chunk}" if args.chunk is not None else args.mode
+    chunk_suffix = f"_chunk{args.chunk}" if args.chunk is not None else ""
+    chunk_lo = args.chunk * args.chunk_size if args.chunk is not None else 0
+    chunk_hi = chunk_lo + args.chunk_size if args.chunk is not None else float("inf")
+
     # Initialize data generator
     df_generator = data_generator(
-        args.data_dir, mode=args.mode, 
+        args.data_dir, mode=args.mode,
         winrate_split_ratio=args.winrate_split_ratio)
 
     # Load previous state if exists
-    state = load_state(args.dump_dir, mode=args.mode)
+    state = load_state(args.dump_dir, mode=output_tag)
     start_concept_id = state.get("concept_id", 0) if state else 0
     finish_stanza = state.get("stanza", False) if state else False
     logger.warning(f"Starting concept_id: {start_concept_id}")
@@ -414,6 +430,7 @@ def eval_steering(args):
          args.lm_model, args.winrate_baseline, { }, args.steer_data_type)
         for concept_id, current_df in df_generator
         if concept_id >= start_concept_id
+        if chunk_lo <= concept_id < chunk_hi
         for evaluator_name in args.steering_evaluators
         for model_name in args.models
         if model_name not in STEERING_EXCLUDE_MODELS
@@ -434,8 +451,8 @@ def eval_steering(args):
     all_results = {}
     lm_caches = {}
     ### accomodate for rule special cases that need stanza
-    temp_results_path = os.path.join(dump_dir, f"temp_all_results.pkl")
-    temp_dfs_path = os.path.join(dump_dir, f"temp_eval_dfs.pkl")
+    temp_results_path = os.path.join(dump_dir, f"temp_all_results{chunk_suffix}.pkl")
+    temp_dfs_path = os.path.join(dump_dir, f"temp_eval_dfs{chunk_suffix}.pkl")
     print("finish stanza", finish_stanza)
     if not finish_stanza:
         # Create all evaluation tasks - flattened for maximum parallelization
@@ -450,6 +467,7 @@ def eval_steering(args):
             args.lm_model, args.winrate_baseline, { }, args.steer_data_type)
             for concept_id, current_df in df_generator
             if concept_id >= start_concept_id
+            if chunk_lo <= concept_id < chunk_hi
             for evaluator_name in args.steering_evaluators
             for model_name in args.models
             if model_name not in STEERING_EXCLUDE_MODELS
@@ -507,7 +525,7 @@ def eval_steering(args):
             pickle.dump(eval_dfs, f)
 
         # Save state
-        state_path = os.path.join(args.dump_dir, f"{args.mode}_{STATE_FILE}") 
+        state_path = os.path.join(args.dump_dir, f"{output_tag}_{STATE_FILE}")
         with open(state_path, "wb") as f:
             pickle.dump({"concept_id": 0, "stanza": True}, f)
 
@@ -522,60 +540,90 @@ def eval_steering(args):
             print("loading temp dfs")
             eval_dfs = pickle.load(f)
 
-    for task in all_tasks:
-        concept_id, evaluator_str, model_str, result, lm_report, lm_cache, current_df = \
-            eval_steering_single_task_local(task, local_lm)
-        if concept_id not in all_results:
-            all_results[concept_id] = {}
-            eval_dfs[concept_id] = {}
-        if evaluator_str not in all_results[concept_id]:
-            all_results[concept_id][evaluator_str] = {}
-            eval_dfs[concept_id][evaluator_str] = {}
-        all_results[concept_id][evaluator_str][model_str] = result
-        if ("raw_relevance_concept_ratings" in result or \
-            "raw_relevance_instruction_ratings" in result or \
-            "raw_fluency_ratings" in result or \
-            "raw_aggregated_ratings" in result) and evaluator_str == "LMJudgeEvaluator":
-            current_df[f"{model_str}_{evaluator_str}_relevance_concept_ratings"] = result["raw_relevance_concept_ratings"]
-            current_df[f"{model_str}_{evaluator_str}_relevance_instruction_ratings"] = result["raw_relevance_instruction_ratings"]
-            current_df[f"{model_str}_{evaluator_str}_fluency_ratings"] = result["raw_fluency_ratings"]
-            current_df[f"{model_str}_{evaluator_str}"] = result["raw_aggregated_ratings"]
-            current_df[f"{model_str}_{evaluator_str}_relevance_concept_completions"] = result["relevance_concept_completions"]
-            current_df[f"{model_str}_{evaluator_str}_relevance_instruction_completions"] = result["relevance_instruction_completions"]
-            current_df[f"{model_str}_{evaluator_str}_fluency_completions"] = result["fluency_completions"]
-            eval_dfs[concept_id][evaluator_str][model_str] = current_df.copy()
+    # `all_tasks` is grouped contiguously by concept_id (the list comprehension's
+    # outer loop variable), so groupby splits it back into one run per concept
+    # without needing to re-sort. Checkpointing after each concept's tasks --
+    # rather than only after every concept in the run has finished -- means a
+    # mid-job interruption (e.g. preemption on mit_preemptable) only loses the
+    # concept in progress, not every concept judged so far, and a resumed run
+    # picks up from state["concept_id"] instead of restarting at 0.
+    saved_concept_ids = set()
+    for concept_id, concept_tasks in itertools.groupby(all_tasks, key=lambda t: t[0]):
+        for task in concept_tasks:
+            _, evaluator_str, model_str, result, lm_report, lm_cache, current_df = \
+                eval_steering_single_task_local(task, local_lm)
+            if concept_id not in all_results:
+                all_results[concept_id] = {}
+                eval_dfs[concept_id] = {}
+            if evaluator_str not in all_results[concept_id]:
+                all_results[concept_id][evaluator_str] = {}
+                eval_dfs[concept_id][evaluator_str] = {}
+            all_results[concept_id][evaluator_str][model_str] = result
+            if ("raw_relevance_concept_ratings" in result or \
+                "raw_relevance_instruction_ratings" in result or \
+                "raw_fluency_ratings" in result or \
+                "raw_aggregated_ratings" in result) and evaluator_str == "LMJudgeEvaluator":
+                current_df[f"{model_str}_{evaluator_str}_relevance_concept_ratings"] = result["raw_relevance_concept_ratings"]
+                current_df[f"{model_str}_{evaluator_str}_relevance_instruction_ratings"] = result["raw_relevance_instruction_ratings"]
+                current_df[f"{model_str}_{evaluator_str}_fluency_ratings"] = result["raw_fluency_ratings"]
+                current_df[f"{model_str}_{evaluator_str}"] = result["raw_aggregated_ratings"]
+                current_df[f"{model_str}_{evaluator_str}_relevance_concept_completions"] = result["relevance_concept_completions"]
+                current_df[f"{model_str}_{evaluator_str}_relevance_instruction_completions"] = result["relevance_instruction_completions"]
+                current_df[f"{model_str}_{evaluator_str}_fluency_completions"] = result["fluency_completions"]
+                eval_dfs[concept_id][evaluator_str][model_str] = current_df.copy()
 
-        if "rule_following" in result and evaluator_str == "RuleEvaluator" and args.mode != "train_data":
-            current_df[f"{model_str}_{evaluator_str}_rule_following"] = result["raw_rule_following"]
-            eval_dfs[concept_id][evaluator_str][model_str] = current_df.copy()
+            if "rule_following" in result and evaluator_str == "RuleEvaluator" and args.mode != "train_data":
+                current_df[f"{model_str}_{evaluator_str}_rule_following"] = result["raw_rule_following"]
+                eval_dfs[concept_id][evaluator_str][model_str] = current_df.copy()
 
-        elif "rule_following" in result and evaluator_str == "RuleEvaluator" and args.mode == "train_data":
-            current_df[f"{evaluator_str}_rule_following_winning"] = result["raw_rule_following_winning"]
-            current_df[f"{evaluator_str}_rule_following_losing"] = result["raw_rule_following_losing"]
-            eval_dfs[concept_id][evaluator_str][model_str] = current_df.copy()
+            elif "rule_following" in result and evaluator_str == "RuleEvaluator" and args.mode == "train_data":
+                current_df[f"{evaluator_str}_rule_following_winning"] = result["raw_rule_following_winning"]
+                current_df[f"{evaluator_str}_rule_following_losing"] = result["raw_rule_following_losing"]
+                eval_dfs[concept_id][evaluator_str][model_str] = current_df.copy()
 
-        lm_reports += [lm_report]
-        lm_caches.update(lm_cache)
-        logger.warning(f"Completed task for concept_id: {concept_id}, model: {model_str}, evaluator: {evaluator_str}")
+            lm_reports += [lm_report]
+            lm_caches.update(lm_cache)
+            logger.warning(f"Completed task for concept_id: {concept_id}, model: {model_str}, evaluator: {evaluator_str}")
 
-    for concept_id, eval_results in sorted(all_results.items()):
         save_results(
-            dump_dir, 
-            {"concept_id": concept_id+1, "stanza": True}, 
-            concept_id, 
-            args.mode, 
-            eval_results, 
+            dump_dir,
+            {"concept_id": concept_id + 1, "stanza": True},
+            concept_id,
+            output_tag,
+            all_results[concept_id],
             eval_dfs[concept_id]
         )
-        
+        saved_concept_ids.add(concept_id)
+
+    # Concepts whose only steering_evaluator work was Rule+stanza (handled
+    # entirely by the pre-pass above, so they never appear in all_tasks) are
+    # never visited by the loop above -- save those here, same as before.
+    for concept_id, eval_results in sorted(all_results.items()):
+        if concept_id in saved_concept_ids:
+            continue
+        save_results(
+            dump_dir,
+            {"concept_id": concept_id + 1, "stanza": True},
+            concept_id,
+            output_tag,
+            eval_results,
+            eval_dfs[concept_id]
+        )
+
 
     if args.mode == "train_data":
         return
+    if args.chunk is not None:
+        logger.warning(
+            f"Chunk {args.chunk} done -- results written to {output_tag}.jsonl / "
+            f"{output_tag}_data.parquet. Run --merge_chunks once all chunks finish."
+        )
+        return
     # Reload for plotting and optional winrate
-    
-    
+
+
     aggregated_results = process_jsonl_file(
-        load_jsonl(os.path.join(dump_dir / f'{args.mode}.jsonl')))
+        load_jsonl(os.path.join(dump_dir / f'{output_tag}.jsonl')))
    
     # Aggregate LM reports
     aggregated_lm_report = {
@@ -595,6 +643,104 @@ def eval_steering(args):
     plot_metrics_multiple_datasets(os.path.join(dump_dir, "steering_data.parquet"), dump_dir, args.report_to, args.wandb_name, args.mode, rule = args.steer_data_type=="rule")
     #plot_metrics_multiple_datasets(os.path.join(dump_dir, "steering_data.parquet"), dump_dir, args.report_to, args.wandb_name, args.mode, rule = args.steer_data_type=="rule")
     logger.warning("Evaluation completed!")
+
+
+def merge_chunks(args):
+    """
+    Combine per-chunk result files written by N separate `--chunk`-scoped
+    `eval_steering` runs into the same canonical {mode}.jsonl /
+    {mode}_data.parquet / {mode}_evaluate_state.pkl files a single unchunked
+    run would have produced. Chunks are discovered by globbing rather than
+    trusting --chunk_size/count, so this merges whatever chunk files exist.
+    """
+    dump_dir = Path(args.dump_dir)
+    prefix = f"{args.mode}_chunk"
+
+    def chunk_index(path):
+        # "{mode}_chunk{N}.jsonl" -> N, "{mode}_chunk{N}_data.parquet" -> N
+        name = os.path.basename(path)[len(prefix):]
+        try:
+            return int(name.split(".")[0].split("_")[0])
+        except ValueError:
+            return -1
+
+    jsonl_paths = sorted(glob.glob(str(dump_dir / f"{prefix}*.jsonl")), key=chunk_index)
+    if not jsonl_paths:
+        raise FileNotFoundError(
+            f"No chunk result files found matching {prefix}*.jsonl in {dump_dir}")
+    logger.warning(f"Merging {len(jsonl_paths)} chunk file(s): {jsonl_paths}")
+
+    merged_entries = []
+    for path in tqdm(jsonl_paths, desc="Merging chunk jsonl files"):
+        merged_entries.extend(load_jsonl(path))
+
+    concept_ids = [entry["concept_id"] for entry in merged_entries]
+    if len(concept_ids) != len(set(concept_ids)):
+        raise ValueError(
+            "Duplicate concept_id found across chunk .jsonl files -- refusing to merge.")
+    missing = sorted(set(range(min(concept_ids), max(concept_ids) + 1)) - set(concept_ids))
+    if missing:
+        logger.warning(
+            f"Merging with {len(missing)} missing concept_id(s) in range "
+            f"[{min(concept_ids)}, {max(concept_ids)}]: {missing}. "
+            "Some chunks may not have finished yet -- the merged result is incomplete.")
+
+    merged_entries.sort(key=lambda entry: entry["concept_id"])
+    merged_jsonl_path = dump_dir / f"{args.mode}.jsonl"
+    with open(merged_jsonl_path, "w") as f:
+        for entry in merged_entries:
+            f.write(json.dumps(entry) + "\n")
+
+    parquet_paths = sorted(glob.glob(str(dump_dir / f"{prefix}*_data.parquet")), key=chunk_index)
+    if parquet_paths:
+        merged_df = pd.concat(
+            [pd.read_parquet(p) for p in tqdm(parquet_paths, desc="Merging chunk parquet files")],
+            ignore_index=True)
+        merged_df = merged_df.sort_values(["concept_id", "input_id"]).reset_index(drop=True)
+        merged_df.to_parquet(dump_dir / f"{args.mode}_data.parquet", index=False)
+    else:
+        logger.warning(
+            f"No chunk parquet files found matching {prefix}*_data.parquet -- skipping parquet merge.")
+
+    state_path = dump_dir / f"{args.mode}_{STATE_FILE}"
+    with open(state_path, "wb") as f:
+        pickle.dump({"concept_id": max(concept_ids) + 1, "stanza": True}, f)
+    logger.warning(f"Merged {len(merged_entries)} concept result(s) into {merged_jsonl_path}")
+
+    # Everything that fed the merge above is now redundant with the merged
+    # {mode}.jsonl / {mode}_data.parquet / {mode}_evaluate_state.pkl -- offer
+    # to clean it up rather than leaving it to accumulate across runs.
+    stale_paths = jsonl_paths + parquet_paths
+    stale_paths += sorted(
+        glob.glob(str(dump_dir / f"{prefix}*_evaluate_state.pkl")), key=chunk_index)
+    stale_paths += sorted(glob.glob(str(dump_dir / "temp_all_results_chunk*.pkl")))
+    stale_paths += sorted(glob.glob(str(dump_dir / "temp_eval_dfs_chunk*.pkl")))
+    if stale_paths:
+        print("\nThe following per-chunk files are now superseded by the merged output:")
+        for p in stale_paths:
+            print(f"  {p}")
+        answer = input(f"Delete these {len(stale_paths)} file(s)? [y/N]: ").strip().lower()
+        if answer in ("y", "yes"):
+            for p in stale_paths:
+                os.remove(p)
+            logger.warning(f"Deleted {len(stale_paths)} stale chunk file(s).")
+        else:
+            logger.warning("Leaving stale chunk files in place.")
+
+    if args.mode == "train_data":
+        return
+
+    # Same tail as the unchunked eval_steering() path, now against the merged
+    # files. Per-chunk LM call totals aren't tracked across process
+    # boundaries, so the "Total calls" report is skipped here (cosmetic only
+    # -- total_price is always 0 for the local judge regardless).
+    aggregated_results = process_jsonl_file(load_jsonl(merged_jsonl_path))
+    logger.warning("Generating final plot...")
+    plot_steering(aggregated_results, dump_dir, args.report_to, args.wandb_name, args.mode)
+    plot_metrics_multiple_datasets(
+        os.path.join(dump_dir, "steering_data.parquet"), dump_dir, args.report_to,
+        args.wandb_name, args.mode, rule=args.steer_data_type == "rule")
+    logger.warning("Merge completed!")
 
 
 def load_jsonl(jsonl_path):
@@ -650,8 +796,38 @@ def main():
                 'help': 'The evaluation mode.'
             }
         },
+        {
+            'args': ['--chunk'],
+            'kwargs': {
+                'type': int,
+                'default': None,
+                'help': '0-based index of the concept chunk to process (steering mode only). '
+                        'Omit to process all concepts as before.'
+            }
+        },
+        {
+            'args': ['--chunk_size'],
+            'kwargs': {
+                'type': int,
+                'default': 100,
+                'help': 'Number of concepts per chunk when --chunk is given.'
+            }
+        },
+        {
+            'args': ['--merge_chunks'],
+            'kwargs': {
+                'action': 'store_true',
+                'help': 'Merge previously-written per-chunk results for --mode into the '
+                        'canonical result files, then exit.'
+            }
+        },
     ]
     args = EvalArgs(custom_args=custom_args, section="evaluate", ignore_unknown=True)
+    # `--chunk` defaults to None via argparse, but EvalArgs only copies an
+    # argparse value onto the instance when it's not None (see EvalArgs.__init__),
+    # so an omitted --chunk never gets an attribute at all -- set it explicitly.
+    if not hasattr(args, "chunk"):
+        args.chunk = None
     if args.mode == "train_data":
         args.data_dir = f"{args.dump_dir}/generate" if args.overwrite_inference_dump_dir is None else Path(args.overwrite_inference_dump_dir)
     else:
@@ -663,6 +839,10 @@ def main():
 
     dump_dir.mkdir(parents=True, exist_ok=True)
     args.dump_dir = dump_dir
+
+    if args.merge_chunks:
+        merge_chunks(args)
+        return
 
     if args.mode == "latent":
         eval_latent(args)

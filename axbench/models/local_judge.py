@@ -18,6 +18,7 @@ os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "OFF")
 os.environ.setdefault("GLOO_LOG_LEVEL", "ERROR")
 logging.getLogger("vllm").setLevel(logging.WARNING)
 
+import torch
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
@@ -37,8 +38,8 @@ class LocalLanguageModel(object):
         model_name=None,
         tokenizer_name=None,
         temperature=0.0,
-        max_tokens=256,
-        batch_size=128,
+        max_tokens=512,
+        batch_size=256,
         **kwargs,
     ):
         self.model = model_name or JUDGE_MODEL_NAME
@@ -46,6 +47,12 @@ class LocalLanguageModel(object):
         self.max_tokens = max_tokens
         self.batch_size = batch_size
         self.total_calls = 0
+        # Runs sequentially process one ~210-prompt batch per (concept, model)
+        # task, so this counts batches across every chat_completions() call on
+        # this instance, not just within one -- logging every batch would mean
+        # one print per task (thousands per run).
+        self._batch_count = 0
+        self._log_every_n_batches = 10
 
         num_gpus = self._count_gpus()
         if num_gpus == 0:
@@ -58,15 +65,14 @@ class LocalLanguageModel(object):
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
             dtype="auto",
-            max_num_seqs=64,
-            max_model_len=8192,
+            max_num_seqs=210,
+            max_model_len=4096,
             seed=SEED,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name or TOKENIZER_MODEL_NAME)
 
     @staticmethod
     def _count_gpus():
-        import torch
         return torch.cuda.device_count()
 
     def _render_prompt(self, prompt):
@@ -75,9 +81,36 @@ class LocalLanguageModel(object):
             chat, tokenize=False, add_generation_prompt=True)
 
     def _generate_in_batches(self, rendered_prompts, sampling_params, batch_size):
-        for i in range(0, len(rendered_prompts), batch_size):
+        peak_used_gb = 0.0
+        n_batches = (len(rendered_prompts) + batch_size - 1) // batch_size
+        for batch_idx, i in enumerate(range(0, len(rendered_prompts), batch_size)):
             batch = rendered_prompts[i:i + batch_size]
+            self._batch_count += 1
+            should_log = self._batch_count % self._log_every_n_batches == 0
+            if should_log:
+                max_prompt_len = max(len(ids) for ids in self.tokenizer(batch).input_ids)
+                print(f"[local_judge] batch {batch_idx + 1}/{n_batches}: max prompt length after tokenization = {max_prompt_len}", flush=True)
             results = self.llm.generate(batch, sampling_params)
+
+            # VRAM: query the driver directly (cudaMemGetInfo) rather than
+            # torch's caching-allocator stats, since vLLM manages its own KV
+            # cache pool outside torch's allocator.
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            used_gb = (total_bytes - free_bytes) / 1e9
+            total_gb = total_bytes / 1e9
+            peak_used_gb = max(peak_used_gb, used_gb)
+            if should_log:
+                try:
+                    util_pct = torch.cuda.utilization()
+                except Exception:
+                    util_pct = "n/a"
+                print(
+                    f"[local_judge] batch {batch_idx + 1}/{n_batches} (size={len(batch)}): "
+                    f"VRAM {used_gb:.1f}/{total_gb:.1f} GB (peak {peak_used_gb:.1f} GB), "
+                    f"GPU util {util_pct}%",
+                    flush=True,
+                )
+
             yield [r.outputs[0].text for r in results]
 
     async def chat_completions(self, api_names, prompts, batch_size=None):

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -p mit_preemptable
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:h200:1
 #SBATCH -c 8
 #SBATCH --mem=100G
 #SBATCH --time=24:00:00
@@ -9,30 +9,33 @@
 #SBATCH --error=logs/err/%j.err
 
 # Self-submitting dispatcher + worker for evaluate_local.py (local vLLM
-# Llama-3.1-70B judge, diffmean_variants_l20, prod_9b_l20_v1 pre-generated
-# data), run as a single job on mit_preemptable. Only needs 1 GPU -- the
-# 4-bit-quantized 70B judge fits on one (tensor_parallel_size=1).
+# Llama-3.1-70B judge). One GPU is enough for the 4-bit-quantized 70B judge.
 #
-# Usage:
-#   bash run_preemptable_evaluate_local.sh
-# Run from the axbench repo root (or anywhere -- logs/out and logs/err are
-# resolved relative to the current directory at submission time, so `cd`
-# into axbench/ first if you invoke this from elsewhere).
+# Usage: bash run_preemptable_evaluate_local.sh <chunk 0-4> [mode: steering|steering_test]
+# Submit once per chunk (0-4) for 5 concurrent GPU jobs. Run from the repo
+# root, or logs/out and logs/err (relative paths) won't resolve.
 #
-# When run with `bash`, this script holds no GPU allocation itself -- it just
-# submits itself via `sbatch`, which inherits the submitting shell's
-# environment. The re-submitted copy runs under Slurm (with SLURM_JOB_ID set)
-# and executes the actual worker payload below. No OPENAI_API_KEY / .env
-# needed here -- evaluate_local.py never talks to the OpenAI API.
-# Do not `sbatch` this directly unless you know what you're doing.
+# After all 5 chunks for a mode finish, merge them (no GPU needed):
+#   uv run axbench/scripts/evaluate_local.py \
+#     --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
+#     --dump_dir axbench/results --mode steering --merge_chunks
+#
+# `bash ...` just submits itself via sbatch and exits; the actual work runs
+# under Slurm (SLURM_JOB_ID set) below. No OPENAI_API_KEY needed -- this
+# never calls the OpenAI API. Don't `sbatch` this file directly.
 
 set -e
 
 if [ -z "${SLURM_JOB_ID:-}" ]; then
+  CHUNK="${1:?Usage: bash run_preemptable_evaluate_local.sh <chunk index 0-4> [mode: steering|steering_test]}"
+  MODE="${2:-steering}"
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  sbatch "$SCRIPT_DIR/run_preemptable_evaluate_local.sh"
+  sbatch "$SCRIPT_DIR/run_preemptable_evaluate_local.sh" "$CHUNK" "$MODE"
   exit 0
 fi
+
+CHUNK="${1:?Usage: sbatch run_preemptable_evaluate_local.sh <chunk index 0-4> [mode: steering|steering_test]}"
+MODE="${2:-steering}"
 
 # --- Worker payload (runs only once submitted by sbatch, above) ---
 
@@ -41,14 +44,21 @@ cd ~/axbench
 CFG=axbench/sweep/antbaez/diffmean_variants_l20.yaml
 DUMP=axbench/results
 
-# Evaluate (eval split -- selects best steering factor per concept)
-uv run axbench/scripts/evaluate_local.py \
+# flashinfer JIT-compiles a CUDA kernel via nvcc; needs a real toolkit module
+# (not the venv's pip-installed nvcc, which mismatches nvidia-cuda-runtime's
+# version and breaks flashinfer's CCCL header check). 12.9.1 matches torch's
+# cu128 build for the pinned vllm==0.11.2.
+module load cuda/12.9.1
+
+# The .so flashinfer JIT-builds needs GLIBCXX_3.4.26+, newer than the system
+# libstdc++ (3.4.25) -- point at the spack gcc's libstdc++ instead.
+export LD_LIBRARY_PATH="/orcd/software/core/001/spack/pkg/gcc/12.2.0/yt6vabm/lib64:${LD_LIBRARY_PATH:-}"
+
+# --no-sync: 5 concurrent chunks share one .venv; without this, `uv run`'s
+# per-invocation sync races across processes (stale NFS handles, partial
+# installs). Run `uv sync` once, serially, before submitting any chunks.
+uv run --no-sync axbench/scripts/evaluate_local.py \
   --config "$CFG" \
   --dump_dir "$DUMP" \
-  --mode steering
-
-# Evaluate (test split -- re-evaluates using the factor selected above)
-# uv run axbench/scripts/evaluate_local.py \
-#   --config "$CFG" \
-#   --dump_dir "$DUMP" \
-#   --mode steering_test
+  --mode "$MODE" \
+  --chunk "$CHUNK"

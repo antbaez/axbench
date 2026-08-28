@@ -12,7 +12,7 @@ dependencies = [
     "openai>=1.52.1",
     "pyvene>=0.1.8",
     "torch>=2.5.0",
-    "transformers>=4.42.4",
+    "transformers>=4.42.4,<5",
     "wandb>=0.18.5",
     "scikit-learn>=1.5.2",
     "seaborn>=0.12.2",
@@ -23,10 +23,22 @@ dependencies = [
     "umap-learn>=0.5.7",
     "hf-transfer>=0.1.9",
     "stanza>=1.14.0",
-    "vllm>=0.8.0",
+    "vllm==0.11.2",
     "bitsandbytes>=0.45.0",
 ]
+
+[tool.uv]
+# xgrammar 0.2.4 is a broken PyPI release for this platform: it ships
+# macOS and linux-aarch64 wheels but no linux-x86_64 wheel, unlike every
+# neighboring version. Pulled in transitively by vllm once transformers<5
+# forces an older vllm; exclude it so the resolver falls back to 0.2.3.
+override-dependencies = ["xgrammar!=0.2.4"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]

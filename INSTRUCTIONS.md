@@ -57,8 +57,17 @@ uv run axbench/scripts/evaluate.py \
   --mode steering
 ```
 
+## Evaluation
+
 Model steering on the test set. Run this after the eval-set command above — it re-evaluates
 on the held-out test split using the best factor selected there.
+
+```bash
+uv run axbench/scripts/evaluate.py \
+  --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
+  --dump_dir axbench/results \
+  --mode steering
+```
 
 ```bash
 uv run axbench/scripts/evaluate.py \
@@ -67,9 +76,40 @@ uv run axbench/scripts/evaluate.py \
   --mode steering_test
 ```
 
+## Evaluation (local judge)
+
+`evaluate_local.py` runs the same LM-judge steps with a local vLLM
+Llama-3.1-70B judge instead of the OpenAI API. The 500 concepts are split into
+5 fixed 100-concept chunks so 5 separate jobs on `mit_preemptable`. 
+
+Run all 5 chunks for the eval split:
+
 ```bash
-uv run axbench/scripts/evaluate.py \
+cd ~/axbench && for i in 0 1 2 3 4; do bash run_preemptable_evaluate_local.sh "$i" steering; done
+```
+
+Once all 5 finish, merge them into the canonical `steering.jsonl` / `steering_data.parquet`:
+
+```bash
+uv run axbench/scripts/evaluate_local.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
   --dump_dir axbench/results \
-  --mode steering
+  --mode steering \
+  --merge_chunks
+```
+
+Then run all 5 chunks for the test split the same way:
+
+```bash
+cd ~/axbench && for i in 0 1 2 3 4; do bash run_preemptable_evaluate_local.sh "$i" steering_test; done
+```
+
+And merge those:
+
+```bash
+uv run axbench/scripts/evaluate_local.py \
+  --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
+  --dump_dir axbench/results \
+  --mode steering_test \
+  --merge_chunks
 ```
