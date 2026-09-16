@@ -182,10 +182,6 @@ def save(
             combined_df = current_df
     save_df_to_parquet_safely(combined_df, df_path)
 
-    # Also save the same data as JSON for easy human inspection.
-    json_path = os.path.splitext(df_path)[0] + ".json"
-    combined_df.to_json(json_path, orient="records", indent=2, force_ascii=False)
-
 
 def load_state(dump_dir):
     """
@@ -225,12 +221,16 @@ def create_data_latent(dataset_factory, metadata, concept_id, num_of_examples, a
     except:
         sae_id = 0
     concept_genres_map = metadata[concept_id]["concept_genres_map"]
-    # Same generation method as --mode training (create_train_df: concept-rewritten
-    # positives + contrastive minimal-edit negatives), sampled from the held-out "test"
-    # seed-instruction split so eval data doesn't leak from the training seed pool.
-    current_df = dataset_factory.create_train_df(
-        concept, num_of_examples, concept_genres_map,
-        output_length=int(args.output_length), split="test")
+    _, eval_contrast_concepts_map = \
+        dataset_factory.prepare_concepts(
+            [concept], 
+            concept_genres_map=concept_genres_map,
+            contrast_concepts_map={}, api_tag="inference")
+    current_df = dataset_factory.create_eval_df(
+        [concept], num_of_examples, concept_genres_map, {},
+        eval_contrast_concepts_map, input_length=int(args.input_length), 
+        output_length=int(args.output_length), seed=int(args.seed)
+    )
     current_df["concept_id"] = concept_id
     current_df["sae_link"] = sae_link
     current_df["sae_id"] = sae_id
@@ -348,7 +348,7 @@ def generate_latent(generate_args, args):
             dataset_factory, metadata, concept_id, num_of_examples, args)
 
         save_latent(dump_dir, concept_id, 'latent', current_df)
-        logger.info(f"Saved inference dataset for concept {concept_id} to latent_eval_data.parquet")
+        logger.warning(f"Saved inference dataset for concept {concept_id} to latent_eval_data.parquet")
         # After processing, save state
         current_state = {'concept_id': concept_id}
         save_state_latent(args.dump_dir, current_state, 'latent')
@@ -402,16 +402,11 @@ def generate_training(args, generate_args):
 
     # Load lm and tokenizer.
     model_name = model_name_map[all_refs[0].split("/")[3]]
-    # Disabled: unused for --mode training now that create_train_df's instruction-mode
-    # path (and the now-disabled global negative pool in DatasetFactory.__init__) no
-    # longer call the local base LM at all -- only the gpt-4o-mini API client generates
-    # anything. Loading this onto GPU was dead weight.
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     model_name, torch_dtype=torch.bfloat16)
-    model = None
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16)
     is_chat_model = True if model_name in CHAT_MODELS else False
     include_system_prompt = True if model_name == "meta-llama/Llama-3.1-8B-Instruct" else False
-    # model = model.cuda()
+    model = model.cuda()
 
     tokenizer =  AutoTokenizer.from_pretrained(model_name, model_max_length=512)
     tokenizer.padding_side = "right"
@@ -423,7 +418,7 @@ def generate_training(args, generate_args):
         need_resize = True
     else:
         need_resize = False
-    if model is not None and need_resize:
+    if need_resize:
         model.resize_token_embeddings(len(tokenizer))
 
     # Init the dataset factory.
@@ -446,12 +441,6 @@ def generate_training(args, generate_args):
         # prepare concept related data.
         concept_genres_map = \
             dataset_factory.prepare_genre_concepts([concept])
-        genre = concept_genres_map[concept][0]
-        if genre != "text":
-            logger.info(f"Skipping concept '{concept}' (genre={genre}); only generating text data.")
-            with open(os.path.join(dump_dir, STATE_FILE), "wb") as f:
-                pickle.dump({"concept_id": concept_id + 1}, f)
-            continue
         # generate with retry mechanism.
         # try:
         current_df = dataset_factory.create_train_df(

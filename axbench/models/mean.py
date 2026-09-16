@@ -158,6 +158,10 @@ class DiffMean(MeanActivation):
                     {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
                 ).detach()
                 nonbos_mask = inputs["attention_mask"][:,kwargs["prefix_length"]:]
+                sliced_input_ids = inputs["input_ids"][:, kwargs["prefix_length"]:]
+                for i in range(min(3, sliced_input_ids.shape[0])):
+                    kept_ids = sliced_input_ids[i][nonbos_mask[i].bool()]
+                    print(f"[DiffMean] example {i}: {self.tokenizer.decode(kept_ids)}")
                 activations = activations[:,kwargs["prefix_length"]:][nonbos_mask.bool()]
                 labels = inputs["labels"].unsqueeze(1).repeat(
                     1, inputs["input_ids"].shape[1] - kwargs["prefix_length"])
@@ -472,6 +476,9 @@ class MeanTokenDiffMean(MeanActivation):
                     {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
                 ).detach()
                 real_mask = self._real_token_mask(inputs["attention_mask"], prefix_length)
+                for i in range(min(3, inputs["input_ids"].shape[0])):
+                    kept_ids = inputs["input_ids"][i][real_mask[i]]
+                    print(f"[MeanTokenDiffMean] example {i}: {self.tokenizer.decode(kept_ids)}")
                 acts = activations[real_mask]
                 labels = inputs["labels"].unsqueeze(1).repeat(
                     1, activations.shape[1])[real_mask]
@@ -483,7 +490,6 @@ class MeanTokenDiffMean(MeanActivation):
         self.ax.proj.weight.data = \
             mean_positive_activation.unsqueeze(0) - mean_negative_activation.unsqueeze(0)
         set_decoder_norm_to_unit_norm(self.ax)
-        logger.warning("Training finished.")
 
 
 class LastTokenDiffMean(MeanTokenDiffMean):
@@ -527,7 +533,6 @@ class LastTokenDiffMean(MeanTokenDiffMean):
         self.ax.proj.weight.data = \
             mean_positive_activation.unsqueeze(0) - mean_negative_activation.unsqueeze(0)
         set_decoder_norm_to_unit_norm(self.ax)
-        logger.warning("Training finished.")
 
 
 class DiffMeanPositional(MeanTokenDiffMean):
@@ -634,7 +639,6 @@ class DiffMeanPositional(MeanTokenDiffMean):
         collapsed = self.positional_weight.mean(dim=0, keepdim=True)
         self.ax.proj.weight.data = collapsed.to(self.ax.proj.weight.dtype)
         set_decoder_norm_to_unit_norm(self.ax)
-        logger.warning("Training finished.")
 
     def save(self, dump_dir, **kwargs):
         """Save both directions into the standard {model_name}_weight.pt as a dict.
@@ -663,7 +667,6 @@ class DiffMeanPositional(MeanTokenDiffMean):
 
     def load(self, dump_dir=None, **kwargs):
         model_name = kwargs.get("model_name", self.__str__())
-        print(f"Loading {model_name} from {dump_dir}.")
         weight = torch.load(
             f"{dump_dir}/{model_name}_weight.pt", map_location=torch.device("cpu"), weights_only=True)
         if kwargs.get("mode") == "steering":

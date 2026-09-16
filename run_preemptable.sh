@@ -1,81 +1,73 @@
 #!/bin/bash
-#SBATCH -p mit_preemptable
-#SBATCH --gres=gpu:h100:2
-#SBATCH -c 8
-#SBATCH --mem=100G
-#SBATCH --time=24:00:00
-#SBATCH --requeue
-#SBATCH --output=logs/out/%j.out
-#SBATCH --error=logs/err/%j.err
 
-# Self-submitting dispatcher + worker for the AxBench train/inference/evaluate
-# pipeline from INSTRUCTIONS.md (diffmean_variants_l20, prod_9b_l20_v1
-# pre-generated data), run as a single job on mit_preemptable.
+# Dispatcher for the AxBench generate/train/inference/evaluate pipeline
+# (diffmean_variants_l20, our own generated pos_steer_data dataset).
 #
 # Usage:
 #   bash run_preemptable.sh
-# Run from the axbench repo root (or anywhere — logs/out and logs/err are
-# resolved relative to the current directory at submission time, so `cd`
-# into axbench/ first if you invoke this from elsewhere).
+# Run from the axbench repo root (or anywhere -- run_preemptable_job.sh cd's
+# into ~/axbench itself, and logs/out and logs/err are resolved relative to
+# that).
 #
-# When run with `bash`, this script holds no GPU allocation itself — it just
-# sources .env (for OPENAI_API_KEY, used by the LLM judge in inference.py)
-# and submits itself via `sbatch`, which inherits the submitting shell's
-# environment. The re-submitted copy runs under Slurm (with SLURM_JOB_ID set)
-# and executes the actual worker payload below. Do not `sbatch` this directly
-# unless you know what you're doing.
+# Plain bash -- this file holds no GPU allocation and is not itself an sbatch
+# script. Each uncommented stage below submits its own independent job via
+# `sbatch run_preemptable_job.sh <command>`, which owns the actual #SBATCH
+# resource directives. Uncommenting multiple stages submits multiple
+# independent jobs with no ordering guarantee between them -- wait for one to
+# finish before running a stage that depends on it.
+#
+# The inference latent/steering stages below call their own standalone
+# dispatcher scripts (run_preemptable_inference_{latent,steering}.sh), which
+# submit NUM_CHUNKS separate sbatch jobs of their own.
 
 set -e
 
-if [ -z "${SLURM_JOB_ID:-}" ]; then
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "$SCRIPT_DIR/.env" ]; then
-    set -a
-    source "$SCRIPT_DIR/.env"
-    set +a
-  fi
-  sbatch "$SCRIPT_DIR/run_preemptable.sh"
-  exit 0
-fi
-
-# --- Worker payload (runs only once submitted by sbatch, above) ---
-
-cd ~/axbench
-
 CFG=axbench/sweep/antbaez/diffmean_variants_l20.yaml
-DUMP=axbench/results
-DATA=axbench/concept500/prod_9b_l20_v1
+DUMP=axbench/results/prod_9b_l20_concept500_diffmean/pos_steer_data
+NPROC=1
+NUM_CHUNKS=4
 
-# Train
-# uv run torchrun --nproc_per_node=1 axbench/scripts/train.py \
+# Generate (training data: synthesizes concept-injected positive examples + contrastive minimal-edit negatives, per concept)
+# sbatch run_preemptable_job.sh uv run axbench/scripts/generate.py \
 #   --config "$CFG" \
-#   --dump_dir "$DUMP" \
-#   --overwrite_data_dir "$DATA/generate"
+#   --mode training \
+#   --dump_dir "$DUMP"
 
-# Inference (latent) — must run before steering, see INSTRUCTIONS.md
-# uv run torchrun --nproc_per_node=1 axbench/scripts/inference.py \
+# Generate (latent eval data: synthesizes held-out eval data used for concept-detection scoring in latent mode)
+# sbatch run_preemptable_job.sh uv run axbench/scripts/generate.py \
 #   --config "$CFG" \
-#   --dump_dir "$DUMP" \
-#   --overwrite_metadata_dir "$DATA/generate" \
-#   --overwrite_inference_data_dir "$DATA/inference" \
-#   --mode latent
+#   --mode latent \
+#   --dump_dir "$DUMP"
 
-# Inference (steering)
-uv run torchrun --nproc_per_node=1 axbench/scripts/inference.py \
-  --config "$CFG" \
-  --dump_dir "$DUMP" \
-  --overwrite_metadata_dir "$DATA/generate" \
-  --overwrite_inference_data_dir "$DATA/inference" \
-  --mode steering
 
-# Evaluate (eval split — selects best steering factor per concept)
-# uv run axbench/scripts/evaluate.py \
+# Train (fits every configured method — DiffMean, PCA, LAT, DiffMean variants, etc. — independently per concept, sharded across torchrun ranks)
+# sbatch run_preemptable_job.sh uv run torchrun --nproc_per_node="$NPROC" axbench/scripts/train.py \
+#   --config "$CFG" \
+#   --dump_dir "$DUMP"
+
+
+# Inference (latent: scores how strongly each concept's direction fires on held-out text; writes max_act, which calibrates what each steering factor means)
+# bash run_preemptable_inference.sh latent "$CFG" "$DUMP" "$NPROC" "$NUM_CHUNKS"
+
+# Inference (steering: generates concept-steered text per concept x eval prompt x steering factor, injecting the direction scaled by latent mode's max_act; requires latent mode to have run first)
+# bash run_preemptable_inference.sh steering "$CFG" "$DUMP" "$NPROC" "$NUM_CHUNKS"
+
+
+# Evaluate (eval split, local vLLM Llama-3.1-70B judge: routes the LM judge through a local GPU-resident model instead of the OpenAI API, auto-merging its chunks once they all finish)
+bash run_preemptable_evaluate_local.sh steering "$NUM_CHUNKS"
+
+# Evaluate (test split, local vLLM Llama-3.1-70B judge)
+# bash run_preemptable_evaluate_local.sh steering_test "$NUM_CHUNKS"
+
+
+# Evaluate (eval split, OpenAI judge: scores steering generations via PerplexityEvaluator + LMJudgeEvaluator, per concept/factor)
+# sbatch run_preemptable_job.sh uv run axbench/scripts/evaluate.py \
 #   --config "$CFG" \
 #   --dump_dir "$DUMP" \
 #   --mode steering
 
-# Evaluate (test split — re-evaluates using the factor selected above)
-# uv run axbench/scripts/evaluate.py \
+# Evaluate (test split, OpenAI judge: re-scores generations on the test split; picking the best eval-split factor per concept is a manual downstream step, not automated here)
+# sbatch run_preemptable_job.sh uv run axbench/scripts/evaluate.py \
 #   --config "$CFG" \
 #   --dump_dir "$DUMP" \
 #   --mode steering_test

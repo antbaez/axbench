@@ -56,6 +56,23 @@ def harmonic_mean(scores):
         return 0
     return len(scores) / sum(1/s for s in scores)
 
+def chunk_bounds(chunk, num_chunks, n_concepts):
+    """Half-open [lo, hi) concept-id window for one chunk of a num_chunks-way split.
+
+    Remainder concepts go to the leading chunks, so the windows always tile the whole
+    id space exactly -- no concept can fall between two chunks and be silently dropped.
+    Kept identical to inference.chunk_bounds so both stages shard the same way.
+    """
+    if chunk is None:
+        return 0, float("inf")
+    if not 0 <= chunk < num_chunks:
+        raise ValueError(f"--chunk {chunk} is out of range for --num_chunks {num_chunks}")
+    base, remainder = divmod(n_concepts, num_chunks)
+    lo = chunk * base + min(chunk, remainder)
+    hi = lo + base + (1 if chunk < remainder else 0)
+    return lo, hi
+
+
 def data_generator(data_dir, mode, winrate_split_ratio=None):
     """
     Generator function to read data files and yield data subsets by group_id.
@@ -398,8 +415,17 @@ def eval_steering(args):
     # write target -- see --merge_chunks for recombining them afterward.
     output_tag = f"{args.mode}_chunk{args.chunk}" if args.chunk is not None else args.mode
     chunk_suffix = f"_chunk{args.chunk}" if args.chunk is not None else ""
-    chunk_lo = args.chunk * args.chunk_size if args.chunk is not None else 0
-    chunk_hi = chunk_lo + args.chunk_size if args.chunk is not None else float("inf")
+    # Window is derived from the id space of the same parquet data_generator reads, so
+    # --num_chunks alone determines the split and the chunks always tile it exactly.
+    if args.chunk is not None:
+        n_concepts = int(pd.read_parquet(
+            os.path.join(data_dir, "steering_data.parquet"),
+            columns=["concept_id"])["concept_id"].max()) + 1
+        chunk_lo, chunk_hi = chunk_bounds(args.chunk, args.num_chunks, n_concepts)
+        logger.warning(
+            f"Chunk {args.chunk}/{args.num_chunks}: concepts [{chunk_lo}, {chunk_hi})")
+    else:
+        chunk_lo, chunk_hi = 0, float("inf")
 
     # Initialize data generator
     df_generator = data_generator(
@@ -616,8 +642,9 @@ def eval_steering(args):
     if args.chunk is not None:
         logger.warning(
             f"Chunk {args.chunk} done -- results written to {output_tag}.jsonl / "
-            f"{output_tag}_data.parquet. Run --merge_chunks once all chunks finish."
+            f"{output_tag}_data.parquet."
         )
+        maybe_auto_merge_chunks(args)
         return
     # Reload for plotting and optional winrate
 
@@ -645,13 +672,54 @@ def eval_steering(args):
     logger.warning("Evaluation completed!")
 
 
-def merge_chunks(args):
+def _chunk_set_complete(args):
+    """
+    True once every concept in [0, n_concepts) has an entry in some
+    {mode}_chunk*.jsonl file already on disk -- i.e. every --chunk job in the
+    --num_chunks sweep has finished writing its output.
+    """
+    dump_dir = Path(args.dump_dir)
+    jsonl_paths = glob.glob(str(dump_dir / f"{args.mode}_chunk*.jsonl"))
+    if not jsonl_paths:
+        return False
+    n_concepts = int(pd.read_parquet(
+        os.path.join(args.data_dir, "steering_data.parquet"),
+        columns=["concept_id"])["concept_id"].max()) + 1
+    found = set()
+    for p in jsonl_paths:
+        found.update(entry["concept_id"] for entry in load_jsonl(p))
+    return set(range(n_concepts)).issubset(found)
+
+
+def maybe_auto_merge_chunks(args):
+    """
+    Called by a --chunk job right after it finishes its own slice: if every
+    concept in [0, n_concepts) is now covered across all {mode}_chunk*.jsonl
+    files (i.e. this was the last chunk in the --num_chunks sweep to finish),
+    merge them immediately -- a separate --merge_chunks invocation is no
+    longer required. Runs non-interactively: skips merge_chunks' stale-file
+    deletion prompt, which would otherwise hit closed stdin under sbatch.
+
+    If a sibling chunk job's own auto-merge races this one, the loser just
+    logs and moves on: merge_chunks doesn't delete its inputs when
+    non-interactive, so a duplicate merge only costs a wasted read+write, not
+    correctness.
+    """
+    try:
+        if _chunk_set_complete(args):
+            logger.warning(f"All chunks present for {args.mode} -- auto-merging.")
+            merge_chunks(args, interactive=False)
+    except Exception as e:
+        logger.warning(f"Auto-merge skipped ({e}); run --merge_chunks manually if needed.")
+
+
+def merge_chunks(args, interactive=True):
     """
     Combine per-chunk result files written by N separate `--chunk`-scoped
     `eval_steering` runs into the same canonical {mode}.jsonl /
     {mode}_data.parquet / {mode}_evaluate_state.pkl files a single unchunked
     run would have produced. Chunks are discovered by globbing rather than
-    trusting --chunk_size/count, so this merges whatever chunk files exist.
+    trusting --num_chunks, so this merges whatever chunk files exist.
     """
     dump_dir = Path(args.dump_dir)
     prefix = f"{args.mode}_chunk"
@@ -716,16 +784,21 @@ def merge_chunks(args):
     stale_paths += sorted(glob.glob(str(dump_dir / "temp_all_results_chunk*.pkl")))
     stale_paths += sorted(glob.glob(str(dump_dir / "temp_eval_dfs_chunk*.pkl")))
     if stale_paths:
-        print("\nThe following per-chunk files are now superseded by the merged output:")
-        for p in stale_paths:
-            print(f"  {p}")
-        answer = input(f"Delete these {len(stale_paths)} file(s)? [y/N]: ").strip().lower()
-        if answer in ("y", "yes"):
+        if interactive:
+            print("\nThe following per-chunk files are now superseded by the merged output:")
             for p in stale_paths:
-                os.remove(p)
-            logger.warning(f"Deleted {len(stale_paths)} stale chunk file(s).")
+                print(f"  {p}")
+            answer = input(f"Delete these {len(stale_paths)} file(s)? [y/N]: ").strip().lower()
+            if answer in ("y", "yes"):
+                for p in stale_paths:
+                    os.remove(p)
+                logger.warning(f"Deleted {len(stale_paths)} stale chunk file(s).")
+            else:
+                logger.warning("Leaving stale chunk files in place.")
         else:
-            logger.warning("Leaving stale chunk files in place.")
+            logger.warning(
+                f"Leaving {len(stale_paths)} stale chunk file(s) in place (auto-merge); "
+                "delete manually or via --merge_chunks if desired.")
 
     if args.mode == "train_data":
         return
@@ -806,11 +879,12 @@ def main():
             }
         },
         {
-            'args': ['--chunk_size'],
+            'args': ['--num_chunks'],
             'kwargs': {
                 'type': int,
-                'default': 100,
-                'help': 'Number of concepts per chunk when --chunk is given.'
+                'default': 5,
+                'help': 'Total number of chunks the concept set is split into. Concepts are '
+                        'divided into this many contiguous windows; --chunk selects one.'
             }
         },
         {
@@ -828,6 +902,8 @@ def main():
     # so an omitted --chunk never gets an attribute at all -- set it explicitly.
     if not hasattr(args, "chunk"):
         args.chunk = None
+    if not hasattr(args, "num_chunks"):
+        args.num_chunks = 5
     if args.mode == "train_data":
         args.data_dir = f"{args.dump_dir}/generate" if args.overwrite_inference_dump_dir is None else Path(args.overwrite_inference_dump_dir)
     else:

@@ -286,6 +286,58 @@ async def response_with_concept(client, tokenizer, concepts, content, length=Non
     return response_content
 
 
+async def instruction_with_concept(client, tokenizer, concepts, content, length=None, api_tag=""):
+    prompts = []
+    for i, c in enumerate(content):
+        prompts += [T_INSTRUCTION_WITH_CONCEPT.format(
+            INSTRUCTION=c, CONCEPT=concepts[i])]
+    responses = await client.chat_completions(f"{api_tag}.instruction_with_concept", prompts)
+    if length is None:
+        return [response.strip(" '").strip('"') for response in responses]
+
+    instruction_content = []
+    for response in responses:
+        full_tokens = tokenizer.tokenize(response.strip(" '").strip('"'))
+        instruction_tokens = full_tokens[:int(length)]
+        instruction_content.append(tokenizer.convert_tokens_to_string(instruction_tokens))
+    return instruction_content
+
+
+async def get_contrastive_concepts(client, concepts, api_tag=""):
+    """One call per concept: ask for 10 related-but-distinct concepts to swap in later.
+
+    Generating the list once and letting callers sample from it (rather than letting the
+    rewrite prompt invent a contrast concept fresh each time) avoids always converging on
+    the same nearest-neighbor concept for a given target concept.
+    """
+    prompts = [T_GENERATE_CONTRASTIVE_CONCEPTS.format(CONCEPT=concept) for concept in concepts]
+    responses = await client.chat_completions(f"{api_tag}.get_contrastive_concepts", prompts)
+    contrastive_concepts = {}
+    for concept, response in zip(concepts, responses):
+        lines = [line.strip(" -*\t") for line in response.split("\n") if line.strip()]
+        contrastive_concepts[concept] = lines
+    return contrastive_concepts
+
+
+async def instruction_with_related_concept(
+        client, tokenizer, concepts, contrast_concepts, content, length=None, api_tag=""):
+    """Minimally edit an already concept-laden instruction to swap in a different concept."""
+    prompts = []
+    for i, c in enumerate(content):
+        prompts += [T_INSTRUCTION_WITH_RELATED_CONCEPT.format(
+            INSTRUCTION=c, CONCEPT=concepts[i], CONTRAST_CONCEPT=contrast_concepts[i])]
+    responses = await client.chat_completions(f"{api_tag}.instruction_with_related_concept", prompts)
+    if length is None:
+        return [response.strip(" '").strip('"') for response in responses]
+
+    instruction_content = []
+    for response in responses:
+        full_tokens = tokenizer.tokenize(response.strip(" '").strip('"'))
+        instruction_tokens = full_tokens[:int(length)]
+        instruction_content.append(tokenizer.convert_tokens_to_string(instruction_tokens))
+    return instruction_content
+
+
 async def response_without_concept(client, tokenizer, concepts, content, length=None, api_tag=""):
     prompts = []
     content_token_lengths = []

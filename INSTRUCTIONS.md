@@ -5,7 +5,7 @@ Train and save your methods:
 ```bash
 uv run torchrun --nproc_per_node=1 axbench/scripts/train.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean
 ```
 
 Using pre-generated `prod_9b_l20_v1` data:
@@ -13,7 +13,7 @@ Using pre-generated `prod_9b_l20_v1` data:
 ```bash
 uv run torchrun --nproc_per_node=1 axbench/scripts/train.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
   --overwrite_data_dir axbench/concept500/prod_9b_l20_v1/generate
 ```
 
@@ -22,28 +22,49 @@ uv run torchrun --nproc_per_node=1 axbench/scripts/train.py \
 Must run before steering inference — steering silently falls back to a factor of `1.0` if
 the latent mode hasn't populated `max_activations` first.
 
+Sharded across N preemptable single-GPU jobs. One invocation submits them all; run
+`uv sync` once first, since the jobs use `--no-sync` on a shared venv.
+
 ```bash
-uv run torchrun --nproc_per_node=1 axbench/scripts/inference.py \
-  --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
-  --overwrite_metadata_dir axbench/concept500/prod_9b_l20_v1/generate \
-  --overwrite_inference_data_dir axbench/concept500/prod_9b_l20_v1/inference \
-  --mode latent
+cd ~/axbench && uv sync
+bash run_preemptable_inference.sh latent        # defaults to 5 chunks
 ```
+
+Once all chunks finish, merge and verify (no GPU, no torchrun):
+
+```bash
+uv run axbench/scripts/inference.py \
+  --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
+  --overwrite_metadata_dir axbench/concept500/prod_9b_l20_v1/generate \
+  --mode latent --merge_chunks --verify_chunks
+```
+
+`--verify_chunks` fails loudly if any concept is missing or any `{Model}_max_act` column
+is absent or null. Do not start steering until it passes.
 
 ## Inference (steering)
 
-Using pre-generated `prod_9b_l20_v1` data (same `--dump_dir` as training, so `inference.py`
-picks up the checkpoints `train.py` wrote):
+Requires the merged, verified `inference/latent_data.parquet` from the step above —
+`pre_compute_mean_activations` only reads files matching `latent_*.parquet`, which the
+per-chunk files deliberately don't.
 
 ```bash
-uv run torchrun --nproc_per_node=1 axbench/scripts/inference.py \
-  --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
-  --overwrite_metadata_dir axbench/concept500/prod_9b_l20_v1/generate \
-  --overwrite_inference_data_dir axbench/concept500/prod_9b_l20_v1/inference \
-  --mode steering
+bash run_preemptable_inference.sh steering      # defaults to 5 chunks
 ```
+
+Then merge and verify:
+
+```bash
+uv run axbench/scripts/inference.py \
+  --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
+  --overwrite_metadata_dir axbench/concept500/prod_9b_l20_v1/generate \
+  --mode steering --merge_chunks --verify_chunks
+```
+
+Both modes take `<CFG> <DUMP> <NPROC>` plus a chunk count as their last argument, e.g.
+`bash run_preemptable_inference.sh latent axbench/sweep/antbaez/diffmean_variants_l20.yaml axbench/results/prod_9b_l20_concept500_diffmean 1 8`.
 
 ## Evaluation
 
@@ -53,7 +74,7 @@ the eval split.
 ```bash
 uv run axbench/scripts/evaluate.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
   --mode steering
 ```
 
@@ -65,14 +86,14 @@ on the held-out test split using the best factor selected there.
 ```bash
 uv run axbench/scripts/evaluate.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
   --mode steering
 ```
 
 ```bash
 uv run axbench/scripts/evaluate.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
   --mode steering_test
 ```
 
@@ -82,10 +103,10 @@ uv run axbench/scripts/evaluate.py \
 Llama-3.1-70B judge instead of the OpenAI API. The 500 concepts are split into
 5 fixed 100-concept chunks so 5 separate jobs on `mit_preemptable`. 
 
-Run all 5 chunks for the eval split:
+Run the eval split (one invocation submits all chunks):
 
 ```bash
-cd ~/axbench && for i in 0 1 2 3 4; do bash run_preemptable_evaluate_local.sh "$i" steering; done
+cd ~/axbench && bash run_preemptable_evaluate_local.sh steering
 ```
 
 Once all 5 finish, merge them into the canonical `steering.jsonl` / `steering_data.parquet`:
@@ -93,15 +114,15 @@ Once all 5 finish, merge them into the canonical `steering.jsonl` / `steering_da
 ```bash
 uv run axbench/scripts/evaluate_local.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
   --mode steering \
   --merge_chunks
 ```
 
-Then run all 5 chunks for the test split the same way:
+Then the test split the same way:
 
 ```bash
-cd ~/axbench && for i in 0 1 2 3 4; do bash run_preemptable_evaluate_local.sh "$i" steering_test; done
+cd ~/axbench && bash run_preemptable_evaluate_local.sh steering_test
 ```
 
 And merge those:
@@ -109,7 +130,7 @@ And merge those:
 ```bash
 uv run axbench/scripts/evaluate_local.py \
   --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-  --dump_dir axbench/results \
+  --dump_dir axbench/results/prod_9b_l20_concept500_diffmean \
   --mode steering_test \
   --merge_chunks
 ```

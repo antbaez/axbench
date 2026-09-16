@@ -25,6 +25,10 @@ dependencies = [
     "stanza>=1.14.0",
     "vllm==0.11.2",
     "bitsandbytes>=0.45.0",
+    "plotnine",
+    # Direct requirement, not just the override below: axbench/utils/plot_utils.py
+    # imports it at package import time, so every script needs it present.
+    "matplotlib==3.9.2",
 ]
 
 [tool.uv]
@@ -32,7 +36,12 @@ dependencies = [
 # macOS and linux-aarch64 wheels but no linux-x86_64 wheel, unlike every
 # neighboring version. Pulled in transitively by vllm once transformers<5
 # forces an older vllm; exclude it so the resolver falls back to 0.2.3.
-override-dependencies = ["xgrammar!=0.2.4"]
+#
+# matplotlib is pinned to 3.9.2 (the version this repo's analysis notebooks
+# were built against) because adding plotnine otherwise drags in a newer
+# matplotlib whose font/glyph rendering garbles text drawn with the custom
+# "P052" font family used in analyse.ipynb.
+override-dependencies = ["xgrammar!=0.2.4", "matplotlib==3.9.2"]
 
 [build-system]
 requires = ["hatchling"]

@@ -137,7 +137,6 @@ class Model(BaseModel):
         elif priority_mode == "compute_priority":
             # prioritize COMPUTE
             model_name = kwargs.get("model_name", self.__str__())
-            print(f"Loading {model_name} from {dump_dir}.")
             weight = torch.load(
                 f"{dump_dir}/{model_name}_weight.pt",
                 map_location=torch.device("cpu"),
@@ -402,9 +401,13 @@ class Model(BaseModel):
     
     def pre_compute_mean_activations(self, dump_dir, **kwargs):
         max_activations = {} # sae_id to max_activation
-        # Loop over saved latent files in dump_dir.
+        # Loop over saved latent files in dump_dir. Exact filename, not a
+        # "latent_"-prefix glob: generate.py --mode latent can write
+        # latent_eval_data.parquet into this same directory (when
+        # --overwrite_inference_data_dir points at it), which has no
+        # {model}_max_act column and would otherwise match the prefix too.
         for file in os.listdir(dump_dir):
-            if file.startswith("latent_") and file.endswith(".parquet"):
+            if file == "latent_data.parquet":
                 latent_path = os.path.join(dump_dir, file)
                 latent = pd.read_parquet(latent_path)
                 # loop through unique sorted concept_id

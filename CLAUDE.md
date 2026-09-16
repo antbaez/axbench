@@ -1,5 +1,11 @@
 # CLAUDE.md
 
+## Before making any changes
+
+Before making any changes to this repo (code, config, data files), first tell the user
+what you are going to change and why. Do not edit files until they've had a chance to
+respond.
+
 Reference notes for working in this repo, accumulated across sessions.
 
 ## Benchmarking a custom DiffMean-style steering method
@@ -11,17 +17,105 @@ into AxBench's benchmark pipeline.
 ### 1. Pipeline overview
 
 Five stages, each its own script under `axbench/scripts/`, all driven by one YAML
-with `generate:` / `train:` / `inference:` / `evaluate:` blocks:
+with `generate:` / `train:` / `inference:` / `evaluate:` blocks. `generate.py` and
+`evaluate.py`/`evaluate_local.py` run as plain `uv run` scripts; `train.py` and
+`inference.py` run under `torchrun`.
 
-1. `generate.py` — synthesize training/eval data per concept (skip if reusing
+1. **`generate.py`** — synthesize training/eval data per concept (skip if reusing
    pre-generated data, see concept500 below).
-2. `train.py` — fit each method per concept.
-3. `inference.py --mode latent` and `--mode steering` — run concept detection and
-   steering generation.
-4. `evaluate.py --mode latent`, `--mode steering`, `--mode steering_test` — score
-   results; `steering` picks the best factor on the eval split, `steering_test`
-   re-evaluates on held-out test data using that factor.
-5. `axbench/scripts/analyses.ipynb` — turns evaluation output into the
+
+2. **`train.py`** — fits every configured method (`DiffMean`, PCA, LAT, probes,
+   the `mean.py` variants, etc.) independently per concept. Concepts (not model
+   types) are what get split across `torchrun` ranks — every rank trains *all*
+   configured methods, just on its own concept slice — and each rank writes its
+   own `rank_{r}_{model_name}_weight.pt`/`_bias.pt`. At the end, rank 0 merges all
+   ranks' files by concatenating along the concept dimension into the canonical
+   `{model_name}_weight.pt`/`_bias.pt` (dict-valued checkpoints are merged per-key,
+   which is how multi-tensor methods like `DiffMeanPositional` survive the merge —
+   see §8). Per-rank state (`train_state.pkl_rank_{r}`) records `last_concept_id`
+   so a preempted run resumes instead of retraining finished concepts.
+   `HyperSteer` is a special case: it skips the per-concept loop entirely and
+   trains once on the full dataset from rank 0 only, so the resume/skip machinery
+   doesn't apply to it.
+
+3. **`inference.py --mode latent`** — concept-detection scoring: for each trained
+   method/concept, scores how strongly its direction fires on held-out text,
+   independent of generation. Writes `{ModelName}_max_act` (+ `_max_act_idx`,
+   `tokens`) per example, per-rank, to `inference/rank_*_latent[_chunk*]_data.parquet`.
+   This `max_act` is the value `pre_compute_mean_activations` later reads to
+   calibrate what a given steering factor means in raw activation units for that
+   concept — this is why every method needs a working latent path even if the
+   real goal is only steering (§8). `--chunk`/`--num_chunks` split the concept-id
+   space into deterministic, non-overlapping windows so N independent preemptable
+   jobs can each own a slice; `--merge_chunks` concatenates the chunk files into
+   the single `latent_data.parquet` (the specific filename matters — steering only
+   globs `latent_*.parquet`, which per-chunk files don't match), and
+   `--verify_chunks` fails loudly if any concept is missing or any model's
+   `{Model}_max_act` column is absent/null before steering is allowed to start. A
+   non-positive `max_act` is silently coerced to `50` downstream rather than left
+   as-is.
+
+4. **`inference.py --mode steering`** — generates concept-steered text: for every
+   concept × eval prompt × configured steering factor, injects a learned
+   direction into hidden states during generation. Requires latent mode's merged
+   `latent_data.parquet` first — if a concept's `max_act` is missing, `predict_steer`
+   silently falls back to a factor-scale multiplier of `1.0`, quietly changing what
+   every factor in the sweep means (§8). The actual injected magnitude is
+   `factor * max_act` (logged as `strength`). Which intervention module runs is
+   picked once, globally, via the yaml's `steering_intervention_type` and applied
+   to *every* model in the run: `"addition"` adds the scaled direction at every
+   position (prompt and generated tokens alike); `"clamping"` projects the
+   direction out and replaces it with the scaled version, restoring the original
+   prefix during prefill only. Because pyvene's `unit_locations=None` handling
+   makes it ignore `intervene_on_prompt` entirely, the hook actually fires on both
+   prompt and every decode step regardless of that flag — any intervention that
+   should be prompt-only or decode-excluded must self-gate on `base.shape[1]`, as
+   `PositionwiseAdditionIntervention` and `SubspaceIntervention` both do (§9).
+   Sharding/chunking and `--merge_chunks`/`--verify_chunks` work the same way as
+   latent mode, writing to `steering_data.parquet`.
+
+5. **`evaluate.py --mode steering` / `--mode steering_test`** — scores the
+   `steering_data.parquet` generations concept-by-concept, fanning out
+   `(concept, evaluator, model)` combinations across a process pool. Evaluators
+   are config-driven (`steering_evaluators`, typically `PerplexityEvaluator` +
+   `LMJudgeEvaluator`); `LMJudgeEvaluator` calls an OpenAI-API judge model three
+   times per generation (concept relevance / instruction relevance / fluency, 0-2
+   each) and combines them via a harmonic mean, then averages per steering
+   factor. Output is `steering[_test].jsonl` (per-concept, per-factor scores) and
+   an annotated `steering[_test]_data.parquet`, plus plots and OpenAI usage/cost
+   logging. **Important, verified from code:** a `get_best_factors()` function
+   (argmax of mean `lm_judge_rating` per concept) exists in this file, but it is
+   *not* invoked anywhere in the `--mode steering`/`steering_test` main flow — no
+   automatic "pick the best eval-split factor and apply it to the test split"
+   step actually runs inside `evaluate.py`. Both modes evaluate every steering
+   factor present in the input parquet; the only difference between them is which
+   half of each concept's `input_id`s `data_generator` yields (governed by
+   `winrate_split_ratio`, off by default). Turning eval-split scores into a single
+   best-factor test-split number is therefore a join a downstream consumer
+   (`analyses.ipynb`, presumably) must do by hand — treat the "steering picks the
+   best factor, steering_test re-evaluates using it" framing as the *intended*
+   design, not something this script currently automates. Malformed judge
+   responses silently fall back to a rating of `0.0` rather than raising.
+
+6. **`evaluate_local.py --mode steering_test`** — a drop-in variant of
+   `evaluate.py` that runs the identical `eval_steering()` code path but routes
+   LM-judge calls through one shared, GPU-resident local vLLM Llama-3.1-70B judge
+   instead of the OpenAI API (built for a preemptable HPC partition, batching
+   requests via vLLM instead of a process pool of API clients). The same
+   "`get_best_factors` exists but isn't wired into `steering_test`" caveat above
+   applies here too — it re-judges whichever factors are present in its data
+   slice, it doesn't filter to a previously-selected best factor. The 500
+   concepts are split into 5 fixed, deterministic chunks via the same
+   `chunk_bounds()` logic `inference.py` uses (so both stages shard identically);
+   `run_preemptable_evaluate_local.sh` self-resubmits one Slurm job per chunk with
+   `--requeue`, and per-concept state pickles let a preempted chunk resume rather
+   than restart. `--merge_chunks` combines all `{mode}_chunk*` files into the
+   canonical `{mode}.jsonl`/`{mode}_data.parquet`, warning (not erroring) about any
+   concept still missing — running it before every chunk has finished silently
+   produces an incomplete merge. `steering` and `steering_test` chunks/merges are
+   entirely independent of each other.
+
+7. **`axbench/scripts/analyses.ipynb`** — turns evaluation output into the
    paper/leaderboard-style numbers.
 
 ### 2. How to add a new steering method

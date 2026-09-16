@@ -1,0 +1,22 @@
+NaN count:
+DiffMean: 0
+\begin{tabular}{lll}
+\toprule
+Method & 9b, l20, concept500 & Average \\
+\midrule
+NaN & 0.770 & 0.770 \\
+\bottomrule
+\end{tabular}
+
+
+NaN count:
+DiffMean: 0
+\begin{tabular}{lll}
+\toprule
+Method & 9b, l20, concept500 & Average \\
+\midrule
+NaN & 0.770$^{+0.017}_{-0.016}$ & 0.770$^{+0.017}_{-0.017}$ \\
+\bottomrule
+\end{tabular}
+
+

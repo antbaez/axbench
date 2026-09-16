@@ -1,0 +1,46 @@
+NaN count:
+DiffMean: 0
+DiffMeanPositional: 0
+LastTokenDiffMean: 0
+MeanTokenDiffMean: 0
+\begin{tabular}{lll}
+\toprule
+Method & 9b, l20, concept500 & Average \\
+\midrule
+MeanTokenDiffMean & 73.6\% & 73.6\% \\
+DiffMean & 53.3\% & 53.3\% \\
+LastTokenDiffMean & 50.0\% & 50.0\% \\
+DiffMeanPositional & 47.9\% & 47.9\% \\
+\bottomrule
+\end{tabular}
+
+
+NaN count:
+DiffMean: 0
+DiffMeanPositional: 0
+LastTokenDiffMean: 0
+MeanTokenDiffMean: 0
+\begin{tabular}{lll}
+\toprule
+Method & 9b, l20, concept500 & Average \\
+\midrule
+MeanTokenDiffMean & 73.6\%$^{+0.032}_{-0.029}$ & 73.6\%$^{+0.031}_{-0.033}$ \\
+DiffMean & 53.3\%$^{+0.028}_{-0.032}$ & 53.3\%$^{+0.031}_{-0.031}$ \\
+LastTokenDiffMean & 50.0\%$^{+0.000}_{-0.000}$ & 50.0\%$^{+0.000}_{-0.000}$ \\
+DiffMeanPositional & 47.9\%$^{+0.027}_{-0.025}$ & 47.9\%$^{+0.028}_{-0.027}$ \\
+\bottomrule
+\end{tabular}
+
+
+9b, l20, concept500: DiffMean vs DiffMeanPositional: T-statistic: 3.4809794523146493, P-value: 0.0005434117765181169 (Significant)
+9b, l20, concept500: DiffMean vs LastTokenDiffMean: T-statistic: 2.142240316011064, P-value: 0.032657449500362964 (Significant)
+9b, l20, concept500: DiffMean vs MeanTokenDiffMean: T-statistic: -10.506313937247587, P-value: 1.8443590204492996e-23 (Significant)
+9b, l20, concept500: DiffMeanPositional vs LastTokenDiffMean: T-statistic: -1.4980483739672013, P-value: 0.13475297959473517 
+9b, l20, concept500: DiffMeanPositional vs MeanTokenDiffMean: T-statistic: -14.07149341624729, P-value: 4.0947162089071417e-38 (Significant)
+9b, l20, concept500: LastTokenDiffMean vs MeanTokenDiffMean: T-statistic: -14.660753637166014, P-value: 9.98145911353904e-41 (Significant)
+None: DiffMean vs DiffMeanPositional: T-statistic: 3.4809794523146493, P-value: 0.0005434117765181169 (Significant)
+None: DiffMean vs LastTokenDiffMean: T-statistic: 2.142240316011064, P-value: 0.032657449500362964 (Significant)
+None: DiffMean vs MeanTokenDiffMean: T-statistic: -10.506313937247587, P-value: 1.8443590204492996e-23 (Significant)
+None: DiffMeanPositional vs LastTokenDiffMean: T-statistic: -1.4980483739672013, P-value: 0.13475297959473517 
+None: DiffMeanPositional vs MeanTokenDiffMean: T-statistic: -14.07149341624729, P-value: 4.0947162089071417e-38 (Significant)
+None: LastTokenDiffMean vs MeanTokenDiffMean: T-statistic: -14.660753637166014, P-value: 9.98145911353904e-41 (Significant)

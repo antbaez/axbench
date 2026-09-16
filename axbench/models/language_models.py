@@ -155,7 +155,7 @@ class LanguageModel(object):
         usage = raw_completion['usage']
         return (completion, usage)
         
-    async def chat_completions(self, api_names, prompts, batch_size=32):
+    async def chat_completions(self, api_names, prompts, batch_size=64):
         """handling batched async calls with internal batching mechanism"""
         # Ensure api_names is a list of appropriate length
         if not isinstance(api_names, list):

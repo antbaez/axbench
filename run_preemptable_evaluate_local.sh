@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:h200:1
 #SBATCH -c 8
 #SBATCH --mem=100G
-#SBATCH --time=24:00:00
+#SBATCH --time=04:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/out/%j.out
 #SBATCH --error=logs/err/%j.err
@@ -11,14 +11,13 @@
 # Self-submitting dispatcher + worker for evaluate_local.py (local vLLM
 # Llama-3.1-70B judge). One GPU is enough for the 4-bit-quantized 70B judge.
 #
-# Usage: bash run_preemptable_evaluate_local.sh <chunk 0-4> [mode: steering|steering_test]
-# Submit once per chunk (0-4) for 5 concurrent GPU jobs. Run from the repo
-# root, or logs/out and logs/err (relative paths) won't resolve.
+# Usage: bash run_preemptable_evaluate_local.sh [mode: steering|steering_test] [num_chunks]
+# Defaults: mode=steering, num_chunks=5. One invocation submits all N jobs.
+# Run from the repo root, or logs/out and logs/err (relative paths) won't resolve.
 #
-# After all 5 chunks for a mode finish, merge them (no GPU needed):
-#   uv run axbench/scripts/evaluate_local.py \
-#     --config axbench/sweep/antbaez/diffmean_variants_l20.yaml \
-#     --dump_dir axbench/results --mode steering --merge_chunks
+# Once every chunk's output is on disk, the last one to finish auto-merges
+# them into {mode}.jsonl/{mode}_data.parquet itself (see maybe_auto_merge_chunks
+# in evaluate_local.py) -- no separate merge step needed.
 #
 # `bash ...` just submits itself via sbatch and exits; the actual work runs
 # under Slurm (SLURM_JOB_ID set) below. No OPENAI_API_KEY needed -- this
@@ -27,22 +26,25 @@
 set -e
 
 if [ -z "${SLURM_JOB_ID:-}" ]; then
-  CHUNK="${1:?Usage: bash run_preemptable_evaluate_local.sh <chunk index 0-4> [mode: steering|steering_test]}"
-  MODE="${2:-steering}"
+  MODE="${1:-steering}"
+  NUM_CHUNKS="${2:-5}"
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  sbatch "$SCRIPT_DIR/run_preemptable_evaluate_local.sh" "$CHUNK" "$MODE"
+  for ((i = 0; i < NUM_CHUNKS; i++)); do
+    sbatch "$SCRIPT_DIR/run_preemptable_evaluate_local.sh" "$i" "$NUM_CHUNKS" "$MODE"
+  done
   exit 0
 fi
 
-CHUNK="${1:?Usage: sbatch run_preemptable_evaluate_local.sh <chunk index 0-4> [mode: steering|steering_test]}"
-MODE="${2:-steering}"
+CHUNK="${1:?internal: chunk index, passed by the dispatcher branch above}"
+NUM_CHUNKS="${2:-5}"
+MODE="${3:-steering}"
 
 # --- Worker payload (runs only once submitted by sbatch, above) ---
 
 cd ~/axbench
 
 CFG=axbench/sweep/antbaez/diffmean_variants_l20.yaml
-DUMP=axbench/results
+DUMP=axbench/results/prod_9b_l20_concept500_diffmean/pos_steer_data
 
 # flashinfer JIT-compiles a CUDA kernel via nvcc; needs a real toolkit module
 # (not the venv's pip-installed nvcc, which mismatches nvidia-cuda-runtime's
@@ -61,4 +63,5 @@ uv run --no-sync axbench/scripts/evaluate_local.py \
   --config "$CFG" \
   --dump_dir "$DUMP" \
   --mode "$MODE" \
-  --chunk "$CHUNK"
+  --chunk "$CHUNK" \
+  --num_chunks "$NUM_CHUNKS"

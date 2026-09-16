@@ -102,17 +102,19 @@ def load_metadata(metadata_path):
 
 
 def prepare_df(
-    original_df, negative_df, concept, metadata, tokenizer, 
-    binarize, train_on_negative, is_chat_model, output_length, model_name, 
+    original_df, concept, metadata, tokenizer,
+    binarize, train_on_negative, is_chat_model, output_length, model_name,
     max_num_of_examples=None, use_dpo_loss=False, steering_prompt_type="prepend",
     keep_orig_axbench_format=False):
-    
+
     suffix_length, suffix_str = get_suffix_length(tokenizer)
     print(f"Suffix length for {model_name}: {suffix_length}, Suffix string: {suffix_str}")
     genre = metadata["concept_genres_map"][concept][0]
     # assign input and output containing concept with 1, otherwise 0
+    # negatives are this concept's own paired minimal-edit negatives (same concept_id
+    # slice as the positives), not a genre-wide pool across other concepts.
     positive_df = original_df[(original_df["output_concept"] == concept) & (original_df["category"] == "positive")]
-    negative_df = negative_df[(negative_df["concept_genre"] == genre)]
+    negative_df = original_df[(original_df["output_concept"] == EMPTY_CONCEPT) & (original_df["category"] == "negative")]
     if max_num_of_examples:
         positive_df = positive_df.head(max_num_of_examples // 2)
         negative_df = negative_df.head(max_num_of_examples // 2)
@@ -120,13 +122,19 @@ def prepare_df(
         if is_chat_model:
             if model_name in HAS_SYSTEM_PROMPT_MODELS:
                 def apply_chat_template(row):
+                    # No assistant turn: create_train_df always sets output="" for this
+                    # dataset_category now, so an assistant message here would carry no
+                    # real content -- it only added a spurious extra <end_of_turn>+header
+                    # after the real generation prompt (get_suffix_length's 2-token probe
+                    # doesn't account for that shape, so it under-trimmed it). Ending on
+                    # add_generation_prompt's own header instead makes the pooled sequence
+                    # actual prompt activations, matching what inference indexes back from.
                     messages = [
-                        {"role": "system", "content": "You are a helpful assistant."}, 
+                        {"role": "system", "content": "You are a helpful assistant."},
                         {"role": "user", "content": row["input"]},
-                        {"role": "assistant", "content": row["output"]}
                     ]
                     nobos = tokenizer.apply_chat_template(
-                        messages, tokenize=True, add_generation_prompt=True)[1:-suffix_length]
+                        messages, tokenize=True, add_generation_prompt=True)[1:]
                     return tokenizer.decode(nobos)
                 positive_df = positive_df.copy()
                 negative_df = negative_df.copy()
@@ -134,12 +142,13 @@ def prepare_df(
                 negative_df['combined'] = negative_df.apply(apply_chat_template, axis=1)
             else:
                 def apply_chat_template(row):
+                    # See the HAS_SYSTEM_PROMPT_MODELS branch above for why there's no
+                    # assistant turn here.
                     messages = [
                         {"role": "user", "content": row["input"]},
-                        {"role": "assistant", "content": row["output"]}
                     ]
                     nobos = tokenizer.apply_chat_template(
-                        messages, tokenize=True, add_generation_prompt=True)[1:-suffix_length]
+                        messages, tokenize=True, add_generation_prompt=True)[1:]
                     return tokenizer.decode(nobos)
                 positive_df = positive_df.copy()
                 negative_df = negative_df.copy()
@@ -191,15 +200,6 @@ def prepare_df(
                 for column in ["output", "winning_output", "losing_output", "prepend_steered_output", "blend_in_steered_output"]:
                     if column in all_df.columns:
                         apply_output_template(all_df, column)
-
-            # Print sample row data
-            print("\n=== Sample Row Data ===")
-            sample_row = all_df.iloc[0]
-            for column in sample_row.index:
-                print(f"\n{column}:")
-                print("-" * (len(column) + 1))
-                print(f"{sample_row[column]}")
-            print("=====================\n")
 
         return all_df # do nothing, the task will be standard instruction tuning.
 
@@ -368,8 +368,7 @@ def main():
         all_df = pd.read_parquet(os.path.join(args.data_dir, 'dpo_train_data.parquet'))
     else:
         all_df = pd.read_parquet(os.path.join(args.data_dir, 'train_data.parquet')) # this is needed for binarizing the dataset
-    negative_df = all_df[(all_df["output_concept"] == EMPTY_CONCEPT) & (all_df["category"] == "negative")]
-    
+
     df_list = list(df_generator)
     logger.warning(f"Total number of concept df loaded: {len(df_list)}")
     if args.max_concepts:
@@ -431,14 +430,13 @@ def main():
         if last_concept_id is not None and concept_id <= last_concept_id:
             logger.warning(f"Rank {rank} skipping concept_id {concept_id} because it is already processed")
             continue
-        logger.warning(f"Training models for concept_id {concept_id} on rank {rank}")
         for model_name in sorted(args.models.keys()):
-            
+
             if model_name == "HyperSteer":
                 continue # training of HyperSteer is ran separately.
-            
+
             concept = metadata[concept_id]["concept"]
-            logger.warning(f"Training {model_name} with concept {concept}")
+            logger.warning(f"Training {model_name} with concept {concept} for concept_id {concept_id}")
             benchmark_model = getattr(axbench, model_name)(
                 model_instance, tokenizer, layer=args.layer,
                 training_args=args.models[model_name],
@@ -488,7 +486,7 @@ def main():
             }
             prepared_df = concept_df.copy()
             prepared_df = prepare_df(
-                prepared_df, negative_df, concept, metadata[concept_id], tokenizer, 
+                prepared_df, concept, metadata[concept_id], tokenizer,
                 binarize=args.models[model_name].binarize_dataset, 
                 train_on_negative=args.models[model_name].train_on_negative,
                 use_dpo_loss=args.use_dpo_loss,
@@ -512,10 +510,10 @@ def main():
                 model_instance.to(device)
             if model_name == "LoRA":
                 model_instance = benchmark_model.ax_model.unload()
-            logger.warning(f"Saved weights and biases for model {model_name} on rank {rank}")
             # Clean up
             del benchmark_model
             torch.cuda.empty_cache()
+        logger.warning(f"Training finished for concept_id {concept_id}")
         # After processing, save state
         current_state = {'last_concept_id': concept_id}
         save_state(dump_dir, current_state, metadata[concept_id], rank)

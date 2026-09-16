@@ -2,7 +2,7 @@
 #
 # example launch command:
 #     torchrun --nproc_per_node=NUM_GPUS axbench/scripts/inference.py --config axbench/demo/sweep/inference.yaml --mode latent
-import os, argparse, yaml, json, glob, pickle, time, itertools, datetime
+import os, argparse, yaml, json, glob, pickle, re, time, itertools, datetime
 import shutil
 import pandas as pd
 from tqdm.auto import tqdm
@@ -54,24 +54,31 @@ def load_config(config_path):
     return d
 
 
-def load_state(dump_dir, mode, rank, subfolder="inference"):
+def chunk_tag(chunk):
+    """Filename suffix isolating one --chunk's outputs from every other chunk's."""
+    return f"_chunk{chunk}" if chunk is not None else ""
+
+
+def load_state(dump_dir, mode, rank, subfolder="inference", chunk=None):
     """
     Load the state from a file if it exists.
     """
-    state_path = os.path.join(f"{dump_dir}/{subfolder}", f"{mode}_{STATE_FILE}_rank_{rank}")
+    state_path = os.path.join(
+        f"{dump_dir}/{subfolder}", f"{mode}{chunk_tag(chunk)}_{STATE_FILE}_rank_{rank}")
     if os.path.exists(state_path):
         with open(state_path, "rb") as f:
             return pickle.load(f)
     return None
 
 
-def save_state(dump_dir, state, partition, rank):
+def save_state(dump_dir, state, partition, rank, chunk=None):
     if not isinstance(dump_dir, Path):
         dump_dir = Path(dump_dir)
-        
+
     dump_dir.mkdir(parents=True, exist_ok=True)
     # Save state
-    state_path = os.path.join(dump_dir, f"{partition}_{STATE_FILE}_rank_{rank}")
+    state_path = os.path.join(
+        dump_dir, f"{partition}{chunk_tag(chunk)}_{STATE_FILE}_rank_{rank}")
     with open(state_path, "wb") as f:
         pickle.dump(state, f)
 
@@ -99,12 +106,13 @@ def load_metadata_flatten(metadata_path):
 
 def save(
     dump_dir, partition,
-    current_df, rank):
+    current_df, rank, chunk=None):
     # This function saves DataFrames per rank per partition (latent or steering)
     dump_dir = Path(dump_dir)
     dump_dir.mkdir(parents=True, exist_ok=True)
     # Save DataFrame
-    df_path = os.path.join(dump_dir, f"rank_{rank}_{partition}_data.parquet")
+    df_path = os.path.join(
+        dump_dir, f"rank_{rank}_{partition}{chunk_tag(chunk)}_data.parquet")
     
     if "defense" in current_df.columns:
         current_df["defense"] = current_df["defense"].apply(lambda x: "["+','.join(x)+"]" if isinstance(x, list) else str(x))
@@ -133,6 +141,22 @@ def partition_concept_ids(concept_ids, world_size):
         concept_ids_per_rank.append(concept_ids[start:end])
         start = end
     return concept_ids_per_rank
+
+
+def chunk_bounds(chunk, num_chunks, n_concepts):
+    """Half-open [lo, hi) concept-id window for one chunk of a num_chunks-way split.
+
+    Remainder concepts go to the leading chunks, so the windows always tile the whole
+    id space exactly -- no concept can fall between two chunks and be silently dropped.
+    """
+    if chunk is None:
+        return 0, float("inf")
+    if not 0 <= chunk < num_chunks:
+        raise ValueError(f"--chunk {chunk} is out of range for --num_chunks {num_chunks}")
+    base, remainder = divmod(n_concepts, num_chunks)
+    lo = chunk * base + min(chunk, remainder)
+    hi = lo + base + (1 if chunk < remainder else 0)
+    return lo, hi
 
 
 def create_data_latent(dataset_factory, metadata, concept_id, num_of_examples, args):
@@ -220,7 +244,8 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
     steering_factors = args.steering_factors
     steering_datasets = args.steering_datasets
 
-    state = load_state(args.dump_dir, "steering", rank)
+    chunk = getattr(args, "chunk", None)
+    state = load_state(args.dump_dir, "steering", rank, chunk=chunk)
     last_concept_id_processed = state.get("last_concept_id", None) if state else None
     logger.warning(f"Rank {rank} last concept_id processed: {last_concept_id_processed}")
 
@@ -230,6 +255,15 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
     # Partition concept_ids among ranks sequentially
     concept_ids_per_rank = partition_concept_ids(concept_ids, world_size)
     my_concept_ids = concept_ids_per_rank[rank]
+
+    # Restrict to this chunk's concept window, so N independent single-GPU jobs
+    # cover disjoint concepts (rank partitioning is a no-op at world_size=1).
+    if chunk is not None:
+        chunk_lo, chunk_hi = chunk_bounds(chunk, args.num_chunks, max(concept_ids) + 1)
+        my_concept_ids = [c for c in my_concept_ids if chunk_lo <= c < chunk_hi]
+        logger.warning(
+            f"Chunk {chunk}/{args.num_chunks}: concepts [{chunk_lo}, {chunk_hi}) "
+            f"-> {len(my_concept_ids)} to process")
 
     if last_concept_id_processed is not None:
         if last_concept_id_processed in my_concept_ids:
@@ -245,7 +279,7 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
         dist.barrier()
 
         # Rank 0 merges results
-        if rank == 0:
+        if rank == 0 and chunk is None:
             logger.warning("Rank 0 is merging results.")
             # Merge per-rank results
             all_parquet_files = list((overwrite_inference_dump_dir).glob("rank_*_steering_data.parquet"))
@@ -376,7 +410,7 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             continue
         if model_name in STEERING_WITH_SHARED_MODELS:
             model_class = getattr(axbench, model_name)
-            logger.warning(f"Loading {model_class} on {device}.")
+            logger.info(f"Loading {model_class} on {device}.")
             
             benchmark_model = model_class(
                 model_instance, tokenizer, layer=layer,
@@ -402,7 +436,7 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             
             if model_name not in STEERING_WITH_SHARED_MODELS:
                 model_class = getattr(axbench, model_name)
-                logger.warning(f"Loading {model_class} on {device}.")
+                logger.info(f"Loading {model_class} on {device}.")
 
                 benchmark_model = model_class(
                     model_instance, tokenizer, layer=layer,
@@ -473,17 +507,23 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
                 benchmark_model = benchmark_model.to("cpu") # move shared model to cpu to save memory
                 
             torch.cuda.empty_cache()
-        save(overwrite_inference_dump_dir, 'steering', current_df, rank)
-        logger.warning(f"Saved inference results for concept {concept_id} to rank_{rank}_steering_data.parquet")
+        save(overwrite_inference_dump_dir, 'steering', current_df, rank, chunk=chunk)
+        logger.warning(
+            f"Saved inference results for concept {concept_id} to "
+            f"rank_{rank}_steering{chunk_tag(chunk)}_data.parquet")
         # After processing, save state
         current_state = {'last_concept_id': concept_id}
-        save_state(overwrite_inference_dump_dir, current_state, 'steering', rank)
+        save_state(overwrite_inference_dump_dir, current_state, 'steering', rank, chunk=chunk)
 
     # Synchronize all processes
     dist.barrier()
 
-    # Rank 0 merges results
-    if rank == 0:
+    # Rank 0 merges results. Skipped when chunked: each job would otherwise merge
+    # only its own shard over the combined file and then delete its inputs. Instead,
+    # once every chunk's output is present, the last chunk to finish auto-merges them.
+    if rank == 0 and chunk is not None:
+        maybe_auto_merge_chunks(args, "steering", logger)
+    if rank == 0 and chunk is None:
         logger.warning("Rank 0 is merging results.")
         # Merge per-rank results
         all_parquet_files = list((Path(dump_dir) / "inference").glob("rank_*_steering_data.parquet"))
@@ -536,7 +576,8 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
     metadata = load_metadata_flatten(data_dir)
     layer = config["layer"] if config else 0  # default layer for prompt baselines
 
-    state = load_state(args.dump_dir, "latent", rank)
+    chunk = getattr(args, "chunk", None)
+    state = load_state(args.dump_dir, "latent", rank, chunk=chunk)
     last_concept_id_processed = state.get("last_concept_id", None) if state else None
     logger.warning(f"Rank {rank} last concept_id processed: {last_concept_id_processed}")
 
@@ -546,6 +587,15 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
     # Partition concept_ids among ranks sequentially
     concept_ids_per_rank = partition_concept_ids(concept_ids, world_size)
     my_concept_ids = concept_ids_per_rank[rank]
+
+    # Restrict to this chunk's concept window, so N independent single-GPU jobs
+    # cover disjoint concepts (rank partitioning is a no-op at world_size=1).
+    if chunk is not None:
+        chunk_lo, chunk_hi = chunk_bounds(chunk, args.num_chunks, max(concept_ids) + 1)
+        my_concept_ids = [c for c in my_concept_ids if chunk_lo <= c < chunk_hi]
+        logger.warning(
+            f"Chunk {chunk}/{args.num_chunks}: concepts [{chunk_lo}, {chunk_hi}) "
+            f"-> {len(my_concept_ids)} to process")
 
     if last_concept_id_processed is not None:
         if last_concept_id_processed in my_concept_ids:
@@ -633,7 +683,7 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
             if model_name in LATENT_EXCLUDE_MODELS:
                 continue
             model_class = getattr(axbench, model_name)
-            logger.warning(f"Loading {model_class} on {device}.")
+            logger.info(f"Loading {model_class} on {device}.")
             benchmark_model = model_class(
                 model_instance, tokenizer, layer=layer,
                 low_rank_dimension=len(metadata),
@@ -672,17 +722,25 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
                     current_df[f"{model_name}_{k}"] = v
             del benchmark_model
             torch.cuda.empty_cache()
-        save(dump_dir, 'latent', current_df, rank)
-        logger.warning(f"Saved inference results for concept {concept_id} to rank_{rank}_latent_data.parquet")
-        # After processing, save state
+        save(dump_dir, 'latent', current_df, rank, chunk=chunk)
+        logger.warning(
+            f"Saved inference results for concept {concept_id} to "
+            f"rank_{rank}_latent{chunk_tag(chunk)}_data.parquet")
+        # After processing, save state. Written into `dump_dir` (= <root>/inference),
+        # which is where load_state reads from -- previously this wrote to the dump
+        # root instead, so latent mode could never actually resume after preemption.
         current_state = {'last_concept_id': concept_id}
-        save_state(args.dump_dir, current_state, 'latent', rank)
+        save_state(dump_dir, current_state, 'latent', rank, chunk=chunk)
 
     # Synchronize all processes
     dist.barrier()
 
-    # Rank 0 merges results
-    if rank == 0:
+    # Rank 0 merges results. Skipped when chunked: each job would otherwise merge
+    # only its own shard over the combined file and then delete its inputs. Instead,
+    # once every chunk's output is present, the last chunk to finish auto-merges them.
+    if rank == 0 and chunk is not None:
+        maybe_auto_merge_chunks(args, "latent", logger)
+    if rank == 0 and chunk is None:
         logger.warning("Rank 0 is merging results.")
         # Merge per-rank results
         all_parquet_files = list(dump_dir.glob("rank_*_latent_data.parquet"))
@@ -1054,6 +1112,151 @@ def infer_latent_on_train_data(args, rank, world_size, device, logger, training_
         logger.warning("All ranks have finished inference.")
 
 
+def _inference_dir(args):
+    if getattr(args, "overwrite_inference_dump_dir", None) is not None:
+        return Path(args.overwrite_inference_dump_dir)
+    return Path(args.dump_dir) / "inference"
+
+
+def _chunk_set_complete(args, mode):
+    """
+    True once every concept expected for this dataset has a row in some
+    rank_*_{mode}_chunk*_data.parquet file already on disk -- i.e. every
+    --chunk job in the --num_chunks sweep has finished writing its output.
+    """
+    inference_dir = _inference_dir(args)
+    paths = glob.glob(str(inference_dir / f"rank_*_{mode}_chunk*_data.parquet"))
+    if not paths:
+        return False
+    expected = {m["concept_id"] for m in load_metadata_flatten(args.data_dir)}
+    found = set()
+    for p in paths:
+        found.update(pd.read_parquet(p, columns=["concept_id"])["concept_id"].unique())
+    return expected.issubset(found)
+
+
+def maybe_auto_merge_chunks(args, mode, logger):
+    """
+    Called by a --chunk job right after it finishes its own slice: if every
+    concept is now covered across all rank_*_{mode}_chunk*_data.parquet files
+    (i.e. this was the last chunk in the --num_chunks sweep to finish), merge
+    them into {mode}_data.parquet immediately -- a separate --merge_chunks
+    invocation after the sweep is no longer required.
+
+    If a sibling chunk job's own auto-merge races this one, the loser just
+    logs and moves on: merge_chunks doesn't delete its inputs, so a duplicate
+    merge only costs a wasted read+write, not correctness.
+    """
+    try:
+        if _chunk_set_complete(args, mode):
+            logger.warning(f"All chunks present for {mode} -- auto-merging.")
+            merge_chunks(args, mode, logger)
+    except Exception as e:
+        logger.warning(f"Auto-merge skipped ({e}); run --merge_chunks manually if needed.")
+
+
+def merge_chunks(args, mode, logger):
+    """
+    Combine the per-chunk parquets written by N independent `--chunk` jobs into the
+    single unchunked {mode}_data.parquet the downstream stages expect.
+
+    Only latent's merged filename matches the `latent_*.parquet` glob that
+    Model.pre_compute_mean_activations scans, so steering cannot read chunk files
+    directly -- latent must be merged before any steering job starts.
+
+    Per-chunk inputs are left in place; they are named rank_*_{mode}_chunk*_data.parquet,
+    which that glob does not match, so they cannot confuse a later run.
+    """
+    inference_dir = _inference_dir(args)
+    paths = sorted(
+        glob.glob(str(inference_dir / f"rank_*_{mode}_chunk*_data.parquet")),
+        key=lambda p: int(re.search(r"_chunk(\d+)_data\.parquet$", p).group(1)))
+    if not paths:
+        raise FileNotFoundError(
+            f"No chunk files matching rank_*_{mode}_chunk*_data.parquet in {inference_dir}")
+    logger.warning(f"Merging {len(paths)} chunk file(s): {[Path(p).name for p in paths]}")
+
+    # A concept legitimately spans many rows within one chunk file, so overlap has to be
+    # checked per source file rather than by counting rows in the concatenation.
+    seen = {}
+    for p in paths:
+        for cid in pd.read_parquet(p, columns=["concept_id"])["concept_id"].unique():
+            seen.setdefault(cid, []).append(Path(p).name)
+    dupes = {cid: files for cid, files in seen.items() if len(files) > 1}
+    if dupes:
+        sample = list(dupes.items())[:5]
+        raise ValueError(
+            f"{len(dupes)} concept_id(s) appear in more than one chunk file -- refusing to "
+            f"merge. Chunk windows overlap, or stale files from a run with a different "
+            f"--num_chunks are present in {inference_dir}. Examples: {sample}")
+
+    combined = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+    counts = combined.groupby("concept_id").size()
+
+    if mode == "steering":
+        combined = combined.sort_values(
+            by=["concept_id", "input_id", "factor"]).reset_index(drop=True)
+    else:
+        combined = combined.sort_values(by=["concept_id"]).reset_index(drop=True)
+
+    out = inference_dir / f"{mode}_data.parquet"
+    combined.to_parquet(out, engine="pyarrow")
+    logger.warning(
+        f"Wrote {out} -- {len(combined)} rows across {counts.shape[0]} concepts. "
+        f"Per-chunk files left in place; delete them once you are satisfied.")
+
+
+def verify_chunks(args, mode, logger):
+    """
+    Gate the next pipeline stage on a complete, usable merged parquet.
+
+    Checks concept coverage against the metadata, and for latent that every model has
+    a populated {ModelName}_max_act -- the column steering multiplies its factors by.
+    A missing or all-null column there is the silent failure where every steering
+    factor quietly falls back to 1.0.
+    """
+    inference_dir = _inference_dir(args)
+    path = inference_dir / f"{mode}_data.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist -- run --merge_chunks first.")
+    df = pd.read_parquet(path)
+
+    expected = sorted(m["concept_id"] for m in load_metadata_flatten(args.data_dir))
+    found = sorted(df["concept_id"].unique())
+    missing = sorted(set(expected) - set(found))
+    extra = sorted(set(found) - set(expected))
+
+    ok = True
+    logger.warning(f"{path.name}: {len(df)} rows, {len(found)}/{len(expected)} concepts")
+    if missing:
+        ok = False
+        logger.warning(f"  MISSING {len(missing)} concept_id(s), first 10: {missing[:10]}")
+    if extra:
+        ok = False
+        logger.warning(f"  UNEXPECTED concept_id(s), first 10: {extra[:10]}")
+
+    if mode == "latent":
+        for model_name in getattr(args, "models", []) or []:
+            col = f"{model_name}_max_act"
+            if col not in df.columns:
+                ok = False
+                logger.warning(f"  MISSING column {col} -- steering would fall back to 1.0")
+                continue
+            per_concept = df.groupby("concept_id")[col].max()
+            n_null = int(per_concept.isna().sum())
+            n_nonpos = int((per_concept <= 0).sum())
+            if n_null:
+                ok = False
+            logger.warning(
+                f"  {col}: mean={per_concept.mean():.2f} min={per_concept.min():.2f} "
+                f"null={n_null} non-positive={n_nonpos}"
+                + (f"  <- these {n_nonpos} fall back to 50" if n_nonpos else ""))
+
+    if not ok:
+        raise SystemExit(f"verify_chunks FAILED for {path} -- do not start the next stage.")
+    logger.warning(f"verify_chunks PASSED for {path}")
+
+
 def main():
     custom_args = [
         {
@@ -1062,6 +1265,40 @@ def main():
                 'type': str,
                 'default': "all",
                 'help': 'The inference mode.'
+            }
+        },
+        {
+            'args': ['--chunk'],
+            'kwargs': {
+                'type': int,
+                'default': None,
+                'help': '0-based index of the concept chunk to process. Selects one window '
+                        'of the --num_chunks-way split of the concept set. Every output '
+                        'file is tagged so concurrent chunks never collide.'
+            }
+        },
+        {
+            'args': ['--num_chunks'],
+            'kwargs': {
+                'type': int,
+                'default': 5,
+                'help': 'Total number of chunks the concept set is split into. Concepts are '
+                        'divided into this many contiguous windows; --chunk selects one.'
+            }
+        },
+        {
+            'args': ['--merge_chunks'],
+            'kwargs': {
+                'action': 'store_true',
+                'help': 'Merge per-chunk parquets for --mode into {mode}_data.parquet, then exit.'
+            }
+        },
+        {
+            'args': ['--verify_chunks'],
+            'kwargs': {
+                'action': 'store_true',
+                'help': 'Check the merged {mode}_data.parquet for full concept coverage (and, '
+                        'for latent, populated max_act columns), then exit.'
             }
         }
     ]
@@ -1074,12 +1311,30 @@ def main():
     else:
         inference_args.data_dir = f"{inference_args.dump_dir}/generate"
     inference_args.train_dir = f"{inference_args.dump_dir}/train"
+    # The args classes only copy attributes they recognise from the YAML section, so a
+    # flag that is merely absent from the command line never gets set at all.
+    for _name, _default in (
+            ("chunk", None), ("num_chunks", 5),
+            ("merge_chunks", False), ("verify_chunks", False)):
+        if not hasattr(inference_args, _name):
+            setattr(inference_args, _name, _default)
+
     logger.warning("Inferencing with following configuration:")
     logger.warning(inference_args)
     set_seed(inference_args.seed)
 
+    # Merging and verifying are CPU-only bookkeeping over parquets. Handle them before
+    # the process group is created so they can run as a plain `uv run`, without torchrun
+    # and without holding a GPU.
+    if inference_args.merge_chunks or inference_args.verify_chunks:
+        if inference_args.merge_chunks:
+            merge_chunks(inference_args, inference_args.mode, logger)
+        if inference_args.verify_chunks:
+            verify_chunks(inference_args, inference_args.mode, logger)
+        return
+
     # Initialize the process group
-    dist.init_process_group(backend='nccl', init_method='env://', 
+    dist.init_process_group(backend='nccl', init_method='env://',
                           timeout=datetime.timedelta(seconds=60000))
 
 

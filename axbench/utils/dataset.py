@@ -209,30 +209,43 @@ class DatasetFactory(object):
             self.logger.warning(f"Loaded pre-generated data from {self.overwrite_inference_data_dir}.")
 
         # create a shared genre-based negative pools all at once
-        if start_concept_id == 0 and not kwargs.get("is_inference", False):
-            per_category_n = int(num_of_examples // 2)
-            start = time.time()
-            self.logger.warning("Creating genre-based and shared negative examples for all concepts.")
-            functor = continue_with if self.dataset_category == "continuation" else response_with
-            random_examples = []
-            for genre in ["text", "math", "code"]:
-                random_content = get_random_content(
-                    self.seed_sentences if self.dataset_category == "continuation" else self.seed_instructions, 
-                    tokenizer=tokenizer, count=per_category_n, 
-                    genres=[genre], concepts=["random"], length=None, split="train"
-                )
-                concept_outputs = get_model_continues(
-                    self.model, self.tokenizer, random_content["random"],
-                    max_new_tokens=int(output_length*1.5), is_chat_model=is_chat_model, include_system_prompt=include_system_prompt)
-                for i, (prompt, output) in enumerate(zip(random_content["random"], concept_outputs)):
-                    random_examples += [[
-                        prompt, output, EMPTY_CONCEPT, genre, "negative", self.dataset_category
-                    ]]
-            self.negative_df = pd.DataFrame(
-                random_examples, 
-                columns = ['input', 'output', 'output_concept', 'concept_genre', 'category', 'dataset_category'])
-            self.negative_df["concept_id"] = -1
-            self.logger.warning(f"Finished creating negative examples in {round(time.time() - start, 3)} sec.")
+        #
+        # Disabled: this generated a small, redundant batch of negatives via the local
+        # base LM (get_model_continues), duplicating the per-concept negatives that
+        # create_train_df now produces for free (unmodified seed instructions, no LLM
+        # call). Left commented out rather than deleted in case we want it back.
+        #
+        # if start_concept_id == 0 and not kwargs.get("is_inference", False):
+        #     per_category_n = int(num_of_examples // 2)
+        #     start = time.time()
+        #     self.logger.warning("Creating genre-based and shared negative examples for all concepts.")
+        #     functor = continue_with if self.dataset_category == "continuation" else response_with
+        #     random_examples = []
+        #     for genre in ["text", "math", "code"]:
+        #         random_content = get_random_content(
+        #             self.seed_sentences if self.dataset_category == "continuation" else self.seed_instructions,
+        #             tokenizer=tokenizer, count=per_category_n,
+        #             genres=[genre], concepts=["random"], length=None, split="train"
+        #         )
+        #         concept_outputs = get_model_continues(
+        #             self.model, self.tokenizer, random_content["random"],
+        #             max_new_tokens=int(output_length*1.5), is_chat_model=is_chat_model, include_system_prompt=include_system_prompt)
+        #         for i, (prompt, output) in enumerate(zip(random_content["random"], concept_outputs)):
+        #             random_examples += [[
+        #                 prompt, output, EMPTY_CONCEPT, genre, "negative", self.dataset_category
+        #             ]]
+        #     self.negative_df = pd.DataFrame(
+        #         random_examples,
+        #         columns = ['input', 'output', 'output_concept', 'concept_genre', 'category', 'dataset_category'])
+        #     self.negative_df["concept_id"] = -1
+        #     self.logger.warning(f"Finished creating negative examples in {round(time.time() - start, 3)} sec.")
+
+        # generate.py's save() reads dataset_factory.negative_df unconditionally at
+        # concept_id == 0, so it must still exist -- just empty now that generation
+        # above is disabled.
+        self.negative_df = pd.DataFrame(
+            columns = ['input', 'output', 'output_concept', 'concept_genre', 'category', 'dataset_category',
+                       'contrast_concept', 'concept_id'])
 
     def save_cache(self):
         """Save the language model cache before exiting"""
@@ -252,46 +265,46 @@ class DatasetFactory(object):
         # prepare genres if needed
         concept_genres_map = kwargs.get("concept_genres_map", None)
         if concept_genres_map is None:
-            logger.warning("Creating genre for the inputs (not provided).")
+            logger.info("Creating genre for the inputs (not provided).")
             genre_task = get_concept_genres(
-                self.lm_model, concepts, 
+                self.lm_model, concepts,
                 api_tag=kwargs.get("api_tag", "")
             )
             tasks.append(genre_task)
-        
+
         # run tasks
         res = asyncio.run(run_tasks(tasks))
         concept_genres_map = res[0]
 
         # log
-        logger.warning(f"Init finished in {round(time.time() - start, 3)} sec.")
+        logger.info(f"Init finished in {round(time.time() - start, 3)} sec.")
         return concept_genres_map
 
     def prepare_concepts(self, concepts, **kwargs):
         if self.overwrite_inference_data_dir is not None and os.path.exists(self.overwrite_inference_data_dir):
-            self.logger.warning("Using pre-generated metadata.")
+            self.logger.info("Using pre-generated metadata.")
             return {}, {}
 
         start = time.time()
         tasks = []
-        
+
         # contrast concepts
-        logger.warning("Creating contrast concepts for the inputs.")
+        logger.info("Creating contrast concepts for the inputs.")
         contrast_task = get_contrast_concepts(
-            self.lm_model, concepts, kwargs.get("contrast_concepts_map", None), 
+            self.lm_model, concepts, kwargs.get("contrast_concepts_map", None),
             api_tag=kwargs.get("api_tag", ""))
         tasks.append(contrast_task)
 
         # prepare genres if needed
         concept_genres_map = kwargs.get("concept_genres_map", None)
         if concept_genres_map is None:
-            logger.warning("Creating genre for the inputs (not provided).")
+            logger.info("Creating genre for the inputs (not provided).")
             genre_task = get_concept_genres(
-                self.lm_model, concepts, 
+                self.lm_model, concepts,
                 api_tag=kwargs.get("api_tag", "")
             )
             tasks.append(genre_task)
-        
+
         # run tasks
         res = asyncio.run(run_tasks(tasks))
         contrast_concepts_map = res[0]
@@ -300,8 +313,8 @@ class DatasetFactory(object):
 
         # log
         for concept in concepts:
-            logger.warning(f"Found {len(contrast_concepts_map[concept])} contrast concept(s) for concept: {concept}.")
-        logger.warning(f"Init finished in {round(time.time() - start, 3)} sec.")
+            logger.info(f"Found {len(contrast_concepts_map[concept])} contrast concept(s) for concept: {concept}.")
+        logger.info(f"Init finished in {round(time.time() - start, 3)} sec.")
         return concept_genres_map, contrast_concepts_map
 
     def create_imbalance_eval_df(self, subset_n, factor=100):
@@ -327,7 +340,7 @@ class DatasetFactory(object):
         
         if self.overwrite_inference_data_dir is not None and os.path.exists(self.overwrite_inference_data_dir):
             if mode == "balance":
-                self.logger.warning("Using pre-generated data.")
+                self.logger.info("Using pre-generated data.")
                 concept_df = self.pregenerated_inference_df[self.pregenerated_inference_df["concept_id"] == kwargs.get("concept_id")].copy()
                 if len(concept_df) < subset_n * 2:
                     self.logger.warning(f"Number of examples does not meet the requirement. {len(concept_df)} < {subset_n * 2}")
@@ -337,7 +350,7 @@ class DatasetFactory(object):
                
         # start logging
         start = time.time()
-        self.logger.warning("Creating dataframe.")
+        self.logger.info("Creating dataframe.")
         
         # init vars
         lm_model, model, tokenizer = self.lm_model, self.model, self.tokenizer 
@@ -423,56 +436,88 @@ class DatasetFactory(object):
             columns = [
                 'input', 'output', 'output_concept', 'concept_genre', 'category', 'dataset_category'
             ])
-        self.logger.warning(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
+        self.logger.info(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
         return df
     
     def create_train_df(self, concept, n, concept_genres_map, **kwargs):
         lm_model, model, tokenizer = self.lm_model, self.model, self.tokenizer
         
         start = time.time()
-        self.logger.warning("Creating dataframe.")
+        self.logger.info("Creating dataframe.")
         all_examples = []
 
         output_length = kwargs.get("output_length", 32)
 
-        functors = []
-        if self.dataset_category == "continuation":
-            functors = [continue_with_concept, continue_without_concept]
-        else:
-            functors = [response_with_concept, response_without_concept]
-        
         # random sentence or instruction
         genre = concept_genres_map[concept][0]
         concepts_random_content = get_random_content(
-            self.seed_sentences if self.dataset_category == "continuation" else self.seed_instructions, 
-            tokenizer=tokenizer, count=n, 
-            genres=[genre], concepts=[concept], length=None, split="train"
+            self.seed_sentences if self.dataset_category == "continuation" else self.seed_instructions,
+            tokenizer=tokenizer, count=n,
+            genres=[genre], concepts=[concept], length=None, split=kwargs.get("split", "train")
         )
-        per_category_n = int(n // 2)
+        # Use every sampled seed (not just half) -- each seed yields one positive and,
+        # for instruction-category data, one paired negative, so this is what makes the
+        # output size actually match n positives + n negatives instead of silently
+        # dropping half of what was sampled.
+        seed_content = concepts_random_content[concept]
+        seed_concepts = [concept] * len(seed_content)
 
-        # positive continuation / instruction
-        continue_task = functors[0](
-            self.lm_model, self.tokenizer, 
-            concepts=[concept]*len(concepts_random_content[concept][:per_category_n]), 
-            content=concepts_random_content[concept][:per_category_n], length=output_length)
-        concept_outputs = asyncio.run(run_tasks([continue_task]))[0]
-        for i, (prompt, output) in enumerate(zip(concepts_random_content[concept][:per_category_n], concept_outputs)):
-            all_examples += [[
-                prompt, output, concept, genre, "positive", self.dataset_category
-            ]]
+        if self.dataset_category == "continuation":
+            # positive continuation: the concept is injected into the continuation itself.
+            continue_task = continue_with_concept(
+                self.lm_model, self.tokenizer,
+                concepts=seed_concepts, content=seed_content, length=output_length)
+            concept_outputs = asyncio.run(run_tasks([continue_task]))[0]
+            for prompt, output in zip(seed_content, concept_outputs):
+                all_examples += [[
+                    prompt, output, concept, genre, "positive", self.dataset_category, ""
+                ]]
+        else:
+            # positive instruction: the concept is injected into the instruction. No
+            # response is generated -- the dataset holds prompts only, output is left
+            # empty so downstream schema (e.g. train.py's input+output concat) still works.
+            instruction_task = instruction_with_concept(
+                self.lm_model, self.tokenizer,
+                concepts=seed_concepts, content=seed_content)
+            concept_instructions = asyncio.run(run_tasks([instruction_task]))[0]
+            for prompt in concept_instructions:
+                all_examples += [[
+                    prompt, "", concept, genre, "positive", self.dataset_category, ""
+                ]]
+
+            # negative instruction: minimally edit each positive instruction so it relates
+            # to a different, related concept instead. The candidate contrast concepts are
+            # generated once per concept (not per example) and sampled per example, so
+            # negatives don't all converge on the same nearest-neighbor concept.
+            contrastive_task = get_contrastive_concepts(self.lm_model, [concept])
+            contrastive_concepts_map = asyncio.run(run_tasks([contrastive_task]))[0]
+            contrastive_concepts = contrastive_concepts_map[concept]
+            sampled_contrast_concepts = [
+                random.choice(contrastive_concepts) for _ in concept_instructions]
+            related_task = instruction_with_related_concept(
+                self.lm_model, self.tokenizer,
+                concepts=seed_concepts, contrast_concepts=sampled_contrast_concepts,
+                content=concept_instructions)
+            related_instructions = asyncio.run(run_tasks([related_task]))[0]
+            for prompt, contrast_concept in zip(related_instructions, sampled_contrast_concepts):
+                all_examples += [[
+                    prompt, "", EMPTY_CONCEPT, genre, "negative", self.dataset_category,
+                    contrast_concept
+                ]]
 
         # update the column definitions of the DataFrame
         df = pd.DataFrame(
-            all_examples, 
+            all_examples,
             columns = [
-                'input', 'output', 'output_concept', 'concept_genre', 'category', 'dataset_category'
+                'input', 'output', 'output_concept', 'concept_genre', 'category', 'dataset_category',
+                'contrast_concept'
             ])
-        self.logger.warning(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
+        self.logger.info(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
         return df
 
     def create_dpo_df(self, existing_df, **kwargs):
         start = time.time()
-        self.logger.warning("Creating dataframe.")
+        self.logger.info("Creating dataframe.")
         batch_size = kwargs.get("batch_size", 8)
         output_length = kwargs.get("output_length", 32)
         is_chat_model = kwargs.get("is_chat_model", True)
@@ -541,7 +586,7 @@ class DatasetFactory(object):
         # positive_df["prepend_steered_input"] = prepend_steered_prompts
         # positive_df["prepend_steered_output"] = prepend_steered_outputs
 
-        self.logger.warning(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
+        self.logger.info(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
         return positive_df
 
 

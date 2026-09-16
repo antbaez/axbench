@@ -248,6 +248,62 @@ Your task is to:
 **Final Answer:** Return only the final content, following the guidelines above."""
 
 
+T_INSTRUCTION_WITH_CONCEPT = """Given the following instruction:
+
+{INSTRUCTION}
+
+Your task is to:
+
+1. Rewrite the instruction so that it incorporates elements related to '{CONCEPT}'.
+2. Try to avoid copying words from the definition of '{CONCEPT}' if possible.
+3. Ensure the rewritten instruction relates to '{CONCEPT}', even if the overall meaning is not fully coherent.
+
+**Formatting Guidelines:**
+
+- Return only the rewritten instruction.
+- Write the final content (or appropriate format for the genre) in plain text.
+- Do not include any additional text, explanations, or formatting.
+
+**Final Answer:** Return only the final content, following the guidelines above."""
+
+
+T_GENERATE_CONTRASTIVE_CONCEPTS = """Given the concept:
+
+'{CONCEPT}'
+
+Your task is to:
+
+1. Generate a list of 10 different concepts that are related to '{CONCEPT}' (e.g. share a topic, domain, or surface-level word overlap) but are conceptually distinct from it.
+2. Each concept should be specific enough to meaningfully differ from '{CONCEPT}', not just a rewording of it.
+
+**Formatting Guidelines:**
+
+- Return exactly 10 concepts, one per line.
+- Do not number the lines or add any bullet points.
+- Do not include any additional text, explanations, or formatting.
+
+**Final Answer:** Return only the 10 concepts, one per line, following the guidelines above."""
+
+
+T_INSTRUCTION_WITH_RELATED_CONCEPT = """Given the following instruction, which relates to '{CONCEPT}':
+
+{INSTRUCTION}
+
+Your task is to:
+
+1. Rewrite the instruction with the minimum changes necessary so that it relates to '{CONTRAST_CONCEPT}' instead of '{CONCEPT}'.
+2. Keep as much of the original wording and structure as possible -- only change what is required to shift the concept.
+3. Ensure the rewritten instruction logically incorporates '{CONTRAST_CONCEPT}'.
+
+**Formatting Guidelines:**
+
+- Return only the rewritten instruction.
+- Write the final content (or appropriate format for the genre) in plain text.
+- Do not include any additional text, explanations, or formatting.
+
+**Final Answer:** Return only the final content, following the guidelines above."""
+
+
 T_RESPONSE_WITHOUT_CONCEPT = """Given the following instruction:
 
 {INSTRUCTION}
