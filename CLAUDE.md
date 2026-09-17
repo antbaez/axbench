@@ -70,9 +70,12 @@ with `generate:` / `train:` / `inference:` / `evaluate:` blocks. `generate.py` a
    makes it ignore `intervene_on_prompt` entirely, the hook actually fires on both
    prompt and every decode step regardless of that flag — any intervention that
    should be prompt-only or decode-excluded must self-gate on `base.shape[1]`, as
-   `PositionwiseAdditionIntervention` and `SubspaceIntervention` both do (§9).
-   Sharding/chunking and `--merge_chunks`/`--verify_chunks` work the same way as
-   latent mode, writing to `steering_data.parquet`.
+   `PositionwisePromptAdditionIntervention` and `SubspaceIntervention` both do (§9).
+   `MeanTokenDiffMean`/`LastTokenDiffMean` opt out of this global selection
+   entirely — they override `make_model()` to always use `PromptAdditionIntervention`
+   regardless of `steering_intervention_type` (§3). Sharding/chunking and
+   `--merge_chunks`/`--verify_chunks` work the same way as latent mode, writing to
+   `steering_data.parquet`.
 
 5. **`evaluate.py --mode steering` / `--mode steering_test`** — scores the
    `steering_data.parquet` generations concept-by-concept, fanning out
@@ -138,11 +141,16 @@ Three classes added to `axbench/models/mean.py`, all subclassing `MeanActivation
 all reading activations from **left-padded** batches. The stock `DiffMean` is
 deliberately left untouched so its published numbers stay reproducible.
 
-| Class | Vectors per concept | Built from |
-|---|---|---|
-| `MeanTokenDiffMean` | 1 | every real token (`DiffMean`'s behavior, explicitly named) |
-| `LastTokenDiffMean` | 1 | each sequence's final real token only |
-| `DiffMeanPositional` | `num_positions` | the token at each offset *k* back from the sequence end |
+| Class | Vectors per concept | Built from | Steers via |
+|---|---|---|---|
+| `MeanTokenDiffMean` | 1 | every real token (`DiffMean`'s behavior, explicitly named) | `PromptAdditionIntervention` |
+| `LastTokenDiffMean` | 1 | each sequence's final real token only | `PromptAdditionIntervention` (inherited) |
+| `DiffMeanPositional` | `num_positions` | the token at each offset *k* back from the sequence end | `PositionwisePromptAdditionIntervention` |
+
+The last column is each class's own `make_model()` override, not the yaml's
+`steering_intervention_type` — all three hardcode a prefill-only intervention so none
+of them ever touches a generated token, unlike the stock `"addition"`/`"clamping"`
+choices which apply to every other method in the run (§1, §9).
 
 **Why left padding.** It puts the last real token at column `-1` for *every* row, so
 end-aligned indexing is a constant slice instead of a per-row `torch.gather` with
@@ -155,13 +163,21 @@ collator is deliberately not touched (see §8). Padding width is a single global
 **No `position_ids` are passed** — the existing `gather_residual_activations` is
 reused unmodified, relying on RoPE shift-invariance (§9).
 
-**`PositionwiseAdditionIntervention`** (`axbench/models/interventions.py`): weight
+**`PromptAdditionIntervention`** (`axbench/models/interventions.py`): same
+broadcast-to-every-position add as the stock `AdditionIntervention`, but gated with
+the same `base.shape[1] <= 1` decode-step no-op described below — so it steers every
+*prompt* token during prefill and never touches generated tokens. Used by
+`MeanTokenDiffMean` and (by inheritance) `LastTokenDiffMean`.
+
+**`PositionwisePromptAdditionIntervention`** (`axbench/models/interventions.py`,
+renamed from `PositionwiseAdditionIntervention`): weight
 `[n_concepts, num_positions, hidden]` instead of the stock
 `AdditionIntervention`'s `[n_concepts, hidden]`-broadcast-to-all-positions. Applies
 `v_0` to the final prompt token, `v_k` k columns earlier. It suppresses itself on
 decode steps via `base.shape[1] <= 1` — stateless, so it stays correct across the
 batch loop in `predict_steer`, unlike a call counter which would need resetting per
-`generate()` call (a hook `Model.predict_steer` does not provide).
+`generate()` call (a hook `Model.predict_steer` does not provide). Used by
+`DiffMeanPositional`.
 
 **Inference semantics: prompt-only, end-aligned.** Training indexes back from the
 last real token of the instruction+response sequence; at inference the vectors are
@@ -169,6 +185,19 @@ applied end-aligned to the *prompt* and generation is left unsteered. *Accepted
 caveat:* "the end" means end-of-response in training but end-of-prompt at test, so
 vectors are applied to a somewhat different distribution than they were fit on.
 Revisit if results look weak.
+
+**Training semantics: padding is intentionally not masked out.** Position `k`'s
+diff-of-means is computed over *every* example in the batch, not just those with a
+real, non-prefix token `k` back — deliberate, per explicit user request over an
+alternative (masking short examples out of deep positions) that was raised and
+rejected as trading a narrower-but-clean estimate for a broader-but-noisier one. For
+examples too short to reach position `k`, the contributing "activation" is whatever
+the model produces at that column — left-padding or still inside the fixed
+chat-template prefix, neither of which is concept-bearing content. This is a real,
+acknowledged tradeoff, not an oversight: deep positions (large `k`, few long-enough
+examples) are the most exposed, since a bigger share of their contributions there are
+non-content. Revisit if deep-position vectors look degenerate or steering quality
+drops off sharply with `k`.
 
 **Other implementation notes:**
 - *Latent mode:* the positional matrix is collapsed to a mean-across-positions

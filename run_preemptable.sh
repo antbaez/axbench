@@ -22,22 +22,38 @@
 
 set -e
 
+# Load OPENAI_API_KEY (and anything else in .env) for stages run directly
+# in this shell rather than via sbatch run_preemptable_job.sh.
+if [ -f ~/axbench/.env ]; then
+  set -a
+  source ~/axbench/.env
+  set +a
+fi
+
 CFG=axbench/sweep/antbaez/diffmean_variants_l20.yaml
 DUMP=axbench/results/prod_9b_l20_concept500_diffmean/pos_steer_data
 NPROC=1
 NUM_CHUNKS=4
+# generate.py --mode training: concepts generated concurrently, and a cap on total
+# in-flight OpenAI requests across them (set from your gpt-4o-mini rate limits)
+NUM_WORKERS=50
+MAX_CONCURRENT_REQUESTS=1000
 
 # Generate (training data: synthesizes concept-injected positive examples + contrastive minimal-edit negatives, per concept)
-# sbatch run_preemptable_job.sh uv run axbench/scripts/generate.py \
+# uv run axbench/scripts/generate.py \
 #   --config "$CFG" \
 #   --mode training \
-#   --dump_dir "$DUMP"
+#   --dump_dir "$DUMP" \
+#   --num_workers "$NUM_WORKERS" \
+#   --max_concurrent_requests "$MAX_CONCURRENT_REQUESTS"
 
 # Generate (latent eval data: synthesizes held-out eval data used for concept-detection scoring in latent mode)
-# sbatch run_preemptable_job.sh uv run axbench/scripts/generate.py \
+# uv run axbench/scripts/generate.py \
 #   --config "$CFG" \
 #   --mode latent \
-#   --dump_dir "$DUMP"
+#   --dump_dir "$DUMP" \
+#   --num_workers "$NUM_WORKERS" \
+#   --max_concurrent_requests "$MAX_CONCURRENT_REQUESTS"
 
 
 # Train (fits every configured method — DiffMean, PCA, LAT, DiffMean variants, etc. — independently per concept, sharded across torchrun ranks)
@@ -54,10 +70,14 @@ NUM_CHUNKS=4
 
 
 # Evaluate (eval split, local vLLM Llama-3.1-70B judge: routes the LM judge through a local GPU-resident model instead of the OpenAI API, auto-merging its chunks once they all finish)
-bash run_preemptable_evaluate_local.sh steering "$NUM_CHUNKS"
+# bash run_preemptable_evaluate_local.sh steering "$NUM_CHUNKS"
 
 # Evaluate (test split, local vLLM Llama-3.1-70B judge)
-# bash run_preemptable_evaluate_local.sh steering_test "$NUM_CHUNKS"
+bash run_preemptable_evaluate_local.sh steering_test "$NUM_CHUNKS"
+
+
+
+
 
 
 # Evaluate (eval split, OpenAI judge: scores steering generations via PerplexityEvaluator + LMJudgeEvaluator, per concept/factor)

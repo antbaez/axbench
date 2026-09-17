@@ -84,7 +84,10 @@ if [ "$MODE" = "latent" ]; then
   MODE_ARGS=(--overwrite_inference_data_dir "$DUMP/inference")
 fi
 
-uv run torchrun --nproc_per_node="$NPROC" axbench/scripts/inference.py \
+# --no-sync: NUM_CHUNKS concurrent chunk jobs share one .venv; without this,
+# `uv run`'s per-invocation sync races across processes (stale NFS handles,
+# partial installs). Run `uv sync` once, serially, before submitting any chunks.
+uv run --no-sync torchrun --nproc_per_node="$NPROC" --master_port=$((29500 + CHUNK)) axbench/scripts/inference.py \
   --config "$CFG" \
   --dump_dir "$DUMP" \
   --mode "$MODE" \

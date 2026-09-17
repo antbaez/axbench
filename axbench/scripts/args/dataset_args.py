@@ -17,6 +17,12 @@ class DatasetArgs:
     dump_dir: Optional[str] = None
     concept_path: Optional[str] = None
     num_of_examples: Optional[int] = None
+    # size of the one base-instruction pool shared by every concept and every stage
+    num_base_instructions: Optional[int] = None
+    # generate.py --mode training: concepts generated concurrently, and a cap on total
+    # in-flight API requests across all of them (None = uncapped, i.e. up to 64/worker)
+    num_workers: Optional[int] = 1
+    max_concurrent_requests: Optional[int] = None
     latent_layer: Optional[int] = None
     latent_num_of_examples: Optional[int] = None
     latent_batch_size: Optional[int] = None

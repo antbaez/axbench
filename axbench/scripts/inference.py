@@ -357,7 +357,7 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
     dataset_factory = SteeringDatasetFactory(
         tokenizer, dump_dir,
         master_data_dir=args.master_data_dir, lm_client=lm_client,
-        lm_model=args.lm_model,
+        lm_model=args.lm_model, use_cache=args.lm_use_cache,
         has_prompt_steering=has_prompt_steering
     )
     is_chat_model = True if args.model_name in CHAT_MODELS else False
@@ -402,7 +402,26 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             steering_factors, steering_datasets, args, generate_args
         )
         data_per_concept[concept_id] = (current_df, sae_link, sae_id)
-    
+
+    # Debug dump: base prompts actually fed to the model for the first 10 concepts
+    # (by concept_id, not just this shard's first 10), so a run's prompts can be
+    # sanity-checked without digging through the full steering_data.parquet.
+    first_ten_concepts = [c for c in concept_ids[:10] if c in data_per_concept]
+    if first_ten_concepts:
+        base_prompts_debug = {}
+        for concept_id in first_ten_concepts:
+            current_df, _, _ = data_per_concept[concept_id]
+            base_prompts_debug[str(concept_id)] = (
+                current_df.drop_duplicates(subset="input_id")
+                .sort_values("input_id")["input"]
+                .tolist()[:10]
+            )
+        debug_path = Path(overwrite_inference_dump_dir) / f"base_prompts_debug{chunk_tag(chunk)}_rank{rank}.json"
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(debug_path, "w") as f:
+            json.dump(base_prompts_debug, f, indent=2)
+        logger.warning(f"Wrote base prompts for concepts {first_ten_concepts} to {debug_path}")
+
     # Preload models that are shared across concepts, like HyperSteer.
     preloaded_models = dict()
     for model_name in training_args.models.keys():
@@ -1258,6 +1277,7 @@ def verify_chunks(args, mode, logger):
 
 
 def main():
+    start_time = time.time()
     custom_args = [
         {
             'args': ['--mode'],
@@ -1331,6 +1351,8 @@ def main():
             merge_chunks(inference_args, inference_args.mode, logger)
         if inference_args.verify_chunks:
             verify_chunks(inference_args, inference_args.mode, logger)
+        elapsed = time.time() - start_time
+        logger.warning(f"Total time taken: {elapsed:.1f}s ({datetime.timedelta(seconds=int(elapsed))})")
         return
 
     # Initialize the process group
@@ -1389,6 +1411,10 @@ def main():
     elif inference_args.mode == "all":
         infer_latent(inference_args, rank, world_size, device, logger, training_args, generate_args)
         infer_steering(inference_args, rank, world_size, device, logger, training_args, generate_args, suppress_eval_dir=suppress_eval_dir)
+
+    if rank == 0:
+        elapsed = time.time() - start_time
+        logger.warning(f"Total time taken by rank 0: {elapsed:.1f}s ({datetime.timedelta(seconds=int(elapsed))})")
 
     # Finalize the process group
     dist.destroy_process_group()

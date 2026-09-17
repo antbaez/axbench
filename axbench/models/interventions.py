@@ -282,7 +282,36 @@ class AdditionIntervention(
             subspaces["mag"].unsqueeze(dim=-1) * self.proj.weight[subspaces["idx"]]
         output = base + steering_vec.unsqueeze(dim=1)
         return output
-    
+
+
+class PromptAdditionIntervention(
+    SourcelessIntervention,
+    TrainableIntervention,
+    DistributedRepresentationIntervention
+):
+    """Same broadcast-to-every-position addition as AdditionIntervention, but
+    prefill-only: a no-op on decode steps, so only prompt tokens are ever steered.
+
+    Note on prefill detection: AxBench calls generate() with unit_locations=None, which
+    makes pyvene skip its intervene_on_prompt gate entirely, so this hook fires on the
+    prompt *and* on every generated token. base.shape[1] is the only signal available to
+    tell them apart: the prefill pass sees the whole prompt, every decode step sees
+    exactly one token (KV cache). See PositionwisePromptAdditionIntervention below for
+    the same trick applied per-position.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs, keep_last_dim=True)
+        self.proj = torch.nn.Linear(
+                self.embed_dim, kwargs["low_rank_dimension"], bias=True)
+
+    def forward(self, base, source=None, subspaces=None):
+        if base.shape[1] <= 1:
+            return base  # decode step: leave generation unsteered
+        steering_vec = subspaces["max_act"].unsqueeze(dim=-1) * \
+            subspaces["mag"].unsqueeze(dim=-1) * self.proj.weight[subspaces["idx"]]
+        output = base + steering_vec.unsqueeze(dim=1)
+        return output
+
 
 class AdditionSuppressionIntervention(
     SourcelessIntervention,
@@ -1025,7 +1054,7 @@ class PreferenceNodireftIntervention(
         )
 
 
-class PositionwiseAdditionIntervention(
+class PositionwisePromptAdditionIntervention(
     SourcelessIntervention,
     TrainableIntervention,
     DistributedRepresentationIntervention
@@ -1035,7 +1064,8 @@ class PositionwiseAdditionIntervention(
     v_1 to the token before it, and so on for num_positions positions.
 
     Weights are [n_concepts, num_positions, embed_dim] rather than the
-    [n_concepts, embed_dim] that AdditionIntervention broadcasts over every position.
+    [n_concepts, embed_dim] that AdditionIntervention/PromptAdditionIntervention
+    broadcast over every position.
 
     Note on prefill detection: AxBench calls generate() with unit_locations=None, which
     makes pyvene skip its intervene_on_prompt gate entirely, so this hook fires on the

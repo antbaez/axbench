@@ -9,6 +9,7 @@ import yaml
 import json
 import glob
 import pickle
+import time
 import torch
 import shutil
 import requests
@@ -308,7 +309,8 @@ def train_hypersteer(args, generate_args, model_instance, tokenizer, all_df, met
     
 
 def main():
-   
+    start_time = time.time()
+
     args = TrainingArgs(section="train")
     generate_args = DatasetArgs(section="generate")
 
@@ -649,6 +651,10 @@ def main():
                     logger.warning(f"Deleted file {f.name}")
                 except Exception as e:
                     logger.error(f"Error deleting file {f.name}: {e}")
+
+    if rank == 0:
+        elapsed = time.time() - start_time
+        logger.warning(f"Total time taken by rank 0: {elapsed:.1f}s ({datetime.timedelta(seconds=int(elapsed))})")
 
     # Finalize the process group
     dist.destroy_process_group()

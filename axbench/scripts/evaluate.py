@@ -8,7 +8,7 @@ from axbench.models.language_models import (
     LanguageModel
 )
 import ast
-import os, argparse, yaml, json, glob, pickle, tempfile, copy
+import os, argparse, yaml, json, glob, pickle, tempfile, copy, time
 import pandas as pd
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -672,6 +672,7 @@ def eval_latent(args):
         # Initialize a dictionary for storing evaluation results for this `concept_id`
 
 def main():
+    start_time = time.time()
     custom_args = [
         {
             'args': ['--mode'],
@@ -704,6 +705,9 @@ def main():
     elif args.mode == "all":
         eval_latent(args)
         eval_steering(args)
+
+    elapsed = time.time() - start_time
+    logger.warning(f"Total time taken: {elapsed:.1f}s ({datetime.timedelta(seconds=int(elapsed))})")
 
 if __name__ == "__main__":
     main()

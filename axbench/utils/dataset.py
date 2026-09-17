@@ -178,6 +178,103 @@ def get_best_factors_rule(steered_data, type_):
     return best_factors
 
 
+# Shared prompt-construction stores, both written into <dump_dir>/generate.
+#
+# Every stage that builds prompts (generate training, generate latent, inference
+# steering) reads these instead of sampling seeds and generating contrast concepts
+# on its own. That is what keeps the three prompt distributions identical: without
+# them each stage re-rolled its own seeds and its own contrast concepts at
+# temperature 1.0, so training and eval silently drifted apart.
+#
+# Delete a file to get a fresh one on the next run; otherwise it is frozen.
+BASE_INSTRUCTIONS_FILE = "base_instructions.json"
+CONTRASTIVE_CONCEPTS_FILE = "contrastive_concepts.json"
+
+
+def _write_json_atomically(obj, path):
+    """Write via a temp file + rename so a preemption can't leave a truncated store."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def load_base_instructions(data_dir):
+    """The shared pool of base instructions. Raises if it hasn't been created yet."""
+    path = os.path.join(data_dir, BASE_INSTRUCTIONS_FILE)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} does not exist -- run generate.py --mode training first; it "
+            f"creates the shared base-instruction pool every other stage reads.")
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_or_create_base_instructions(data_dir, seed_instructions, n, genre="text"):
+    """One pool of n base instructions, shared by every concept and every stage."""
+    path = os.path.join(data_dir, BASE_INSTRUCTIONS_FILE)
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+
+    dataset = seed_instructions[f"{genre}_train"]
+    if n > len(dataset):
+        raise ValueError(
+            f"num_base_instructions={n} exceeds the {len(dataset)} available in "
+            f"{genre}_train.")
+    # same normalization get_random_content applies to seeds
+    instructions = [
+        dataset[i]["input"].strip(" .'").strip('"')
+        for i in random.sample(range(len(dataset)), n)]
+    os.makedirs(data_dir, exist_ok=True)
+    _write_json_atomically(instructions, path)
+    logger.warning(f"Created {path} with {n} base instructions from {genre}_train.")
+    return instructions
+
+
+def load_contrastive_concepts(data_dir):
+    """Every concept's stored contrast pool, or {} if nothing has been generated."""
+    path = os.path.join(data_dir, CONTRASTIVE_CONCEPTS_FILE)
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_or_create_contrastive_concepts_batch(lm_model, concepts, data_dir, api_tag=""):
+    """Each concept's 10 related-but-distinct concepts, generated once and reused.
+
+    Missing concepts are generated in one batched pass, before any per-concept work,
+    so concurrent generation never has to write the store. Persisted so a preempted
+    run resumes without re-paying for them, and so every later stage draws negatives
+    from the exact same pool each concept was trained against.
+    """
+    store = load_contrastive_concepts(data_dir)
+    missing = list(dict.fromkeys(c for c in concepts if c not in store))
+    if missing:
+        result = asyncio.run(run_tasks([
+            get_contrastive_concepts(lm_model, missing, api_tag=api_tag)]))[0]
+        store.update(result)
+        os.makedirs(data_dir, exist_ok=True)
+        _write_json_atomically(store, os.path.join(data_dir, CONTRASTIVE_CONCEPTS_FILE))
+    return {concept: store[concept] for concept in concepts}
+
+
+def assign_contrast_concepts(contrastive_concepts, n, rng=random):
+    """Pick n contrast concepts by walking a reshuffled pool, cycling as needed.
+
+    Even coverage in a random order, unlike independent draws, which can leave some
+    of the pool unused and over-represent others. Pass a per-concept `rng` when
+    concepts are generated concurrently, so the draw doesn't depend on thread timing.
+    """
+    assigned = []
+    while len(assigned) < n:
+        pool = list(contrastive_concepts)
+        rng.shuffle(pool)
+        assigned.extend(pool)
+    return assigned[:n]
+
+
 class DatasetFactory(object):
     """Main class of async generating training pairs for two subspaces"""
 
@@ -192,8 +289,10 @@ class DatasetFactory(object):
         lm_model = kwargs.get("lm_model", "gpt-4o-mini")
         self.use_cache = use_cache
         self.lm_model = LanguageModel(
-            lm_model, client, dump_dir, 
-            use_cache=use_cache, master_data_dir=master_data_dir
+            lm_model, client, dump_dir,
+            use_cache=use_cache, master_data_dir=master_data_dir,
+            request_limiter=kwargs.get("request_limiter", None),
+            rate_limit_retries=kwargs.get("rate_limit_retries", 0),
         )
         self.seed = kwargs.get("seed", 42)
         self.logger = kwargs.get("logger", logger)
@@ -253,8 +352,9 @@ class DatasetFactory(object):
 
     def reset_stats(self):
         """Reset API costs"""
-        if self.use_cache:
-            self.lm_model.dump()
+        # dump() writes cost.jsonl and the prompt log; that is unrelated to whether
+        # completions are cached, so it runs either way.
+        self.lm_model.dump()
         self.lm_model.stats.print_report()
         self.lm_model.stats.reset()
 
@@ -439,36 +539,41 @@ class DatasetFactory(object):
         self.logger.info(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
         return df
     
-    def create_train_df(self, concept, n, concept_genres_map, **kwargs):
-        lm_model, model, tokenizer = self.lm_model, self.model, self.tokenizer
-        
+    def create_train_df(
+            self, concept, concept_genres_map, base_instructions,
+            contrastive_concepts, categories=("positive", "negative"), **kwargs):
+        """Build concept-injected positives and their paired contrastive negatives.
+
+        The single builder behind all three prompt-producing stages. Base instructions
+        and contrast concepts are passed in rather than sampled/generated here, so every
+        stage draws from the same two stores and the distributions cannot drift.
+
+        `categories` selects which halves to emit. Steering asks for negatives only --
+        a positive already names the concept, leaving the vector nothing to inject --
+        but the positives are still generated, because a negative is a minimal edit of
+        its own positive rather than of the bare base instruction.
+
+        When called from worker threads, pass `lm_model` (a LanguageModel.fork() owned by
+        that thread) and a per-concept `rng`; both default to the shared ones.
+        """
         start = time.time()
         self.logger.info("Creating dataframe.")
         all_examples = []
 
         output_length = kwargs.get("output_length", 32)
+        lm_model = kwargs.get("lm_model", None) or self.lm_model
+        rng = kwargs.get("rng", None) or random
 
-        # random sentence or instruction
         genre = concept_genres_map[concept][0]
-        concepts_random_content = get_random_content(
-            self.seed_sentences if self.dataset_category == "continuation" else self.seed_instructions,
-            tokenizer=tokenizer, count=n,
-            genres=[genre], concepts=[concept], length=None, split=kwargs.get("split", "train")
-        )
-        # Use every sampled seed (not just half) -- each seed yields one positive and,
-        # for instruction-category data, one paired negative, so this is what makes the
-        # output size actually match n positives + n negatives instead of silently
-        # dropping half of what was sampled.
-        seed_content = concepts_random_content[concept]
-        seed_concepts = [concept] * len(seed_content)
+        seed_concepts = [concept] * len(base_instructions)
 
         if self.dataset_category == "continuation":
             # positive continuation: the concept is injected into the continuation itself.
             continue_task = continue_with_concept(
-                self.lm_model, self.tokenizer,
-                concepts=seed_concepts, content=seed_content, length=output_length)
+                lm_model, self.tokenizer,
+                concepts=seed_concepts, content=base_instructions, length=output_length)
             concept_outputs = asyncio.run(run_tasks([continue_task]))[0]
-            for prompt, output in zip(seed_content, concept_outputs):
+            for prompt, output in zip(base_instructions, concept_outputs):
                 all_examples += [[
                     prompt, output, concept, genre, "positive", self.dataset_category, ""
                 ]]
@@ -477,33 +582,30 @@ class DatasetFactory(object):
             # response is generated -- the dataset holds prompts only, output is left
             # empty so downstream schema (e.g. train.py's input+output concat) still works.
             instruction_task = instruction_with_concept(
-                self.lm_model, self.tokenizer,
-                concepts=seed_concepts, content=seed_content)
+                lm_model, self.tokenizer,
+                concepts=seed_concepts, content=base_instructions)
             concept_instructions = asyncio.run(run_tasks([instruction_task]))[0]
-            for prompt in concept_instructions:
-                all_examples += [[
-                    prompt, "", concept, genre, "positive", self.dataset_category, ""
-                ]]
+            if "positive" in categories:
+                for prompt in concept_instructions:
+                    all_examples += [[
+                        prompt, "", concept, genre, "positive", self.dataset_category, ""
+                    ]]
 
-            # negative instruction: minimally edit each positive instruction so it relates
-            # to a different, related concept instead. The candidate contrast concepts are
-            # generated once per concept (not per example) and sampled per example, so
-            # negatives don't all converge on the same nearest-neighbor concept.
-            contrastive_task = get_contrastive_concepts(self.lm_model, [concept])
-            contrastive_concepts_map = asyncio.run(run_tasks([contrastive_task]))[0]
-            contrastive_concepts = contrastive_concepts_map[concept]
-            sampled_contrast_concepts = [
-                random.choice(contrastive_concepts) for _ in concept_instructions]
-            related_task = instruction_with_related_concept(
-                self.lm_model, self.tokenizer,
-                concepts=seed_concepts, contrast_concepts=sampled_contrast_concepts,
-                content=concept_instructions)
-            related_instructions = asyncio.run(run_tasks([related_task]))[0]
-            for prompt, contrast_concept in zip(related_instructions, sampled_contrast_concepts):
-                all_examples += [[
-                    prompt, "", EMPTY_CONCEPT, genre, "negative", self.dataset_category,
-                    contrast_concept
-                ]]
+            if "negative" in categories:
+                # negative instruction: minimally edit each positive instruction so it
+                # relates to a different, related concept instead.
+                sampled_contrast_concepts = assign_contrast_concepts(
+                    contrastive_concepts, len(concept_instructions), rng=rng)
+                related_task = instruction_with_related_concept(
+                    lm_model, self.tokenizer,
+                    concepts=seed_concepts, contrast_concepts=sampled_contrast_concepts,
+                    content=concept_instructions)
+                related_instructions = asyncio.run(run_tasks([related_task]))[0]
+                for prompt, contrast_concept in zip(related_instructions, sampled_contrast_concepts):
+                    all_examples += [[
+                        prompt, "", EMPTY_CONCEPT, genre, "negative", self.dataset_category,
+                        contrast_concept
+                    ]]
 
         # update the column definitions of the DataFrame
         df = pd.DataFrame(
@@ -684,10 +786,11 @@ class SteeringDatasetFactory(object):
         self, tokenizer, dump_dir, has_prompt_steering=False, **kwargs):
         self.tokenizer = tokenizer
         self.master_data_dir = kwargs.get("master_data_dir", None)
+        self.use_cache = kwargs.get("use_cache", False)
         if kwargs.get("lm_client", None):
             self.lm_model = LanguageModel(
-                kwargs.get("lm_model", "gpt-4o-mini"), kwargs["lm_client"], dump_dir, 
-                use_cache=True, master_data_dir=self.master_data_dir
+                kwargs.get("lm_model", "gpt-4o-mini"), kwargs["lm_client"], dump_dir,
+                use_cache=self.use_cache, master_data_dir=self.master_data_dir
             )
         self.has_prompt_steering = has_prompt_steering
 
@@ -764,12 +867,98 @@ class SteeringDatasetFactory(object):
                                 sampled_prompt, formatted_steered_prompt, formatted_prompt, "", "", "", []
                             ]]
                 df = pd.DataFrame(
-                    all_examples, 
+                    all_examples,
                     columns = [
-                        'dataset_name', 'concept_id', 'input_concept', 
+                        'dataset_name', 'concept_id', 'input_concept',
                         'input_id', 'factor', 'original_prompt', 'steered_input', 'input', "suppress_original", "suppress_rewrite", "steered_prompt", "defense"])
                 all_dfs.append(df)
-            
+
+            elif dataset_name == "ContrastInstructions":
+                # Steering prompts drawn from the same distribution training was fit on:
+                # base instructions from the shared pool, rewritten to carry one of this
+                # concept's stored contrast concepts. They must NOT name the target
+                # concept -- otherwise the model would discuss it unprompted and the
+                # judge would score the prompt rather than the intervention.
+                #
+                # Generated once and persisted, so reruns reuse the same eval prompts
+                # (the rewrites are temperature-1.0 and uncached). Delete
+                # steering_eval_data.parquet to get a fresh set.
+                assert dump_dir is not None, "dump_dir is required for ContrastInstructions."
+                data_dir = os.path.join(dump_dir, "generate")
+                cache_path = os.path.join(dump_dir, "inference", "steering_eval_data.parquet")
+
+                cached_df = None
+                if os.path.exists(cache_path):
+                    stored = pd.read_parquet(cache_path)
+                    hit = stored[stored["concept_id"] == concept_id]
+                    if len(hit) >= subset_n:
+                        cached_df = hit.head(subset_n)
+
+                if cached_df is not None:
+                    prompt_rows = cached_df
+                else:
+                    base_instructions = load_base_instructions(data_dir)
+                    contrastive_store = load_contrastive_concepts(data_dir)
+                    concept = concepts[0]
+                    if concept not in contrastive_store:
+                        raise KeyError(
+                            f"'{concept}' is missing from {CONTRASTIVE_CONCEPTS_FILE} in "
+                            f"{data_dir} -- generate.py --mode training writes it.")
+
+                    sampled = random.sample(
+                        base_instructions, min(subset_n, len(base_instructions)))
+                    contrast_concepts = assign_contrast_concepts(
+                        contrastive_store[concept], len(sampled))
+                    # inject the concept first, then swap it out: the negative is a
+                    # minimal edit of its own positive, not of the bare instruction.
+                    positives = asyncio.run(run_tasks([instruction_with_concept(
+                        self.lm_model, self.tokenizer,
+                        concepts=[concept] * len(sampled), content=sampled)]))[0]
+                    negatives = asyncio.run(run_tasks([instruction_with_related_concept(
+                        self.lm_model, self.tokenizer,
+                        concepts=[concept] * len(positives),
+                        contrast_concepts=contrast_concepts, content=positives)]))[0]
+
+                    prompt_rows = pd.DataFrame({
+                        "concept_id": concept_id,
+                        "input_concept": concept,
+                        "input_id": list(range(len(negatives))),
+                        "input": negatives,
+                        "contrast_concept": contrast_concepts[:len(negatives)],
+                    })
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    combined = prompt_rows
+                    if os.path.exists(cache_path):
+                        previous = pd.read_parquet(cache_path)
+                        previous = previous[previous["concept_id"] != concept_id]
+                        combined = pd.concat([previous, prompt_rows], ignore_index=True)
+                    combined.to_parquet(cache_path, index=False)
+
+                all_examples = []
+                for i, row in enumerate(prompt_rows.itertuples()):
+                    system_messages = []
+                    if steering_model_name in HAS_SYSTEM_PROMPT_MODELS:
+                        system_messages = [{"role": "system", "content": "You are a helpful assistant."}]
+                    formatted_prompt = self.tokenizer.decode(
+                        self.tokenizer.apply_chat_template(
+                            system_messages + [{"role": "user", "content": row.input}],
+                            tokenize=True, add_generation_prompt=True)[1:])  # drop bos
+                    for factor in steering_factors:
+                        # 0 mirrors the AlpacaEval branch: this column is the index
+                        # within `concepts` (always one concept here), and the caller
+                        # overwrites it with the real concept_id.
+                        all_examples += [[
+                            dataset_name, 0, row.input_concept,
+                            i, factor, row.input, formatted_prompt, formatted_prompt,
+                            "", "", "", []
+                        ]]
+                df = pd.DataFrame(
+                    all_examples,
+                    columns = [
+                        'dataset_name', 'concept_id', 'input_concept',
+                        'input_id', 'factor', 'original_prompt', 'steered_input', 'input', "suppress_original", "suppress_rewrite", "steered_prompt", "defense"])
+                all_dfs.append(df)
+
             elif dataset_name == "AlpacaEvalSuppress":
                 
                 # load alpaca eval dataset.

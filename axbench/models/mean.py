@@ -12,9 +12,10 @@ from typing import Dict, Optional, Sequence, Union, List, Any
 from torch.utils.data import DataLoader
 from .interventions import (
     AdditionIntervention,
+    PromptAdditionIntervention,
     SubspaceIntervention,
     JumpReLUSAECollectIntervention,
-    PositionwiseAdditionIntervention
+    PositionwisePromptAdditionIntervention
 )
 from ..utils.model_utils import (
     set_decoder_norm_to_unit_norm, 
@@ -158,10 +159,6 @@ class DiffMean(MeanActivation):
                     {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
                 ).detach()
                 nonbos_mask = inputs["attention_mask"][:,kwargs["prefix_length"]:]
-                sliced_input_ids = inputs["input_ids"][:, kwargs["prefix_length"]:]
-                for i in range(min(3, sliced_input_ids.shape[0])):
-                    kept_ids = sliced_input_ids[i][nonbos_mask[i].bool()]
-                    print(f"[DiffMean] example {i}: {self.tokenizer.decode(kept_ids)}")
                 activations = activations[:,kwargs["prefix_length"]:][nonbos_mask.bool()]
                 labels = inputs["labels"].unsqueeze(1).repeat(
                     1, inputs["input_ids"].shape[1] - kwargs["prefix_length"])
@@ -431,10 +428,35 @@ class MeanTokenDiffMean(MeanActivation):
     position, so shifting a sequence rightward changes nothing, and padded columns are
     attended with weight zero. Exists as the explicitly-named counterpart to
     LastTokenDiffMean and as an equivalence check on the left-padding machinery.
+
+    Steers through PromptAdditionIntervention (prefill-only, broadcast to every prompt
+    token), regardless of the yaml's steering_intervention_type -- unlike the stock
+    methods, this and LastTokenDiffMean (which inherits this make_model) never touch
+    generated tokens.
     """
 
     def __str__(self):
         return 'MeanTokenDiffMean'
+
+    def make_model(self, **kwargs):
+        if kwargs.get("mode") != "steering":
+            # train / latent: handled by the parent (MeanActivation / MeanEmbedding)
+            return super().make_model(**kwargs)
+
+        ax = PromptAdditionIntervention(
+            embed_dim=self.model.config.hidden_size,
+            low_rank_dimension=kwargs.get("low_rank_dimension", 1),
+        )
+        self.ax = ax
+        self.ax.train()
+        ax_config = IntervenableConfig(representations=[{
+            "layer": l,
+            "component": f"model.layers[{l}].output",
+            "low_rank_dimension": kwargs.get("low_rank_dimension", 1),
+            "intervention": self.ax} for l in [self.layer]])
+        ax_model = IntervenableModel(ax_config, self.model)
+        ax_model.set_device(self.device)
+        self.ax_model = ax_model
 
     def make_dataloader(self, examples, **kwargs):
         data_module = make_left_padded_data_module(
@@ -476,9 +498,6 @@ class MeanTokenDiffMean(MeanActivation):
                     {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
                 ).detach()
                 real_mask = self._real_token_mask(inputs["attention_mask"], prefix_length)
-                for i in range(min(3, inputs["input_ids"].shape[0])):
-                    kept_ids = inputs["input_ids"][i][real_mask[i]]
-                    print(f"[MeanTokenDiffMean] example {i}: {self.tokenizer.decode(kept_ids)}")
                 acts = activations[real_mask]
                 labels = inputs["labels"].unsqueeze(1).repeat(
                     1, activations.shape[1])[real_mask]
@@ -496,9 +515,10 @@ class LastTokenDiffMean(MeanTokenDiffMean):
     """DiffMean built from only the final real token of each sequence.
 
     Left padding puts that token at column -1 for every row, so this is a plain slice.
-    Produces a single direction, so it steers through the stock AdditionIntervention and
-    is applied at *every* position during inference -- deliberately unlike
-    DiffMeanPositional(num_positions=1), which only steers the final prompt token.
+    Produces a single direction, so it steers through PromptAdditionIntervention
+    (inherited from MeanTokenDiffMean.make_model) and is broadcast to every *prompt*
+    token during prefill only -- deliberately unlike DiffMeanPositional(num_positions=1),
+    which steers only the final prompt token.
     """
 
     def __str__(self):
@@ -543,6 +563,13 @@ class DiffMeanPositional(MeanTokenDiffMean):
     the final prompt token, v_1 on the one before it -- and generation is left unsteered.
     Note the asymmetry: "the end" is end-of-response in training but end-of-prompt at test.
 
+    Deliberate design choice: position k's mean is *not* restricted to examples long
+    enough to have a real, non-prefix token k back. Every example in the batch
+    contributes at every position, even when that lands on left-padding or still
+    inside the chat-template prefix for a given row -- trading some noise at deep
+    positions for keeping every position's mean pooled over the full example set
+    rather than a shrinking, length-biased subset.
+
     Weights are [n_concepts, num_positions, hidden], so save/load are overridden. A
     collapsed mean-across-positions direction is also stored in self.ax so that latent
     mode (predict_latent / pre_compute_mean_activations / get_logits) works unchanged --
@@ -567,7 +594,7 @@ class DiffMeanPositional(MeanTokenDiffMean):
             # train / latent: a single collapsed direction, handled by the parent
             return super().make_model(**kwargs)
 
-        ax = PositionwiseAdditionIntervention(
+        ax = PositionwisePromptAdditionIntervention(
             embed_dim=self.model.config.hidden_size,
             low_rank_dimension=kwargs.get("low_rank_dimension", 1),
             num_positions=self._resolve_num_positions(**kwargs),
@@ -590,7 +617,6 @@ class DiffMeanPositional(MeanTokenDiffMean):
         torch.cuda.empty_cache()
         self.ax.eval()
         self.ax.to(self.device)
-        prefix_length = kwargs["prefix_length"]
 
         hidden_size = self.model.config.hidden_size
         positive_sum = torch.zeros(num_positions, hidden_size, device=self.device)
@@ -605,18 +631,18 @@ class DiffMeanPositional(MeanTokenDiffMean):
                     self.model, self.layer,
                     {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
                 ).detach().float()
-                real_lengths = inputs["attention_mask"].sum(dim=1)
                 labels = inputs["labels"]
 
                 for k in range(min(num_positions, activations.shape[1])):
-                    # position k back from the end; valid only if the row has that many
-                    # real tokens once the chat-template prefix is excluded
-                    valid = (real_lengths - prefix_length) > k
-                    if not valid.any():
-                        continue
+                    # position k back from the end. Every row contributes here
+                    # regardless of whether column (seq_len-1-k) is real content,
+                    # still inside the chat-template prefix, or left-padding for that
+                    # particular row -- deliberately unmasked, so deep positions keep
+                    # pooling over the full batch instead of only whichever examples
+                    # happen to be long enough to have a real token that far back.
                     acts_k = activations[:, activations.shape[1] - 1 - k, :]
-                    is_positive = valid & (labels == 1)
-                    is_negative = valid & (labels != 1)
+                    is_positive = labels == 1
+                    is_negative = labels != 1
                     positive_sum[k] += acts_k[is_positive].sum(dim=0)
                     negative_sum[k] += acts_k[is_negative].sum(dim=0)
                     positive_count[k] += is_positive.sum()
@@ -625,8 +651,8 @@ class DiffMeanPositional(MeanTokenDiffMean):
         empty = ((positive_count == 0) | (negative_count == 0)).nonzero().flatten().tolist()
         if empty:
             logger.warning(
-                f"No examples reached positions {empty}; their vectors will be zero. "
-                f"Consider lowering num_positions ({num_positions}).")
+                f"No positive or negative examples at all in this training call; "
+                f"positions {empty} will be zero.")
 
         weight = (positive_sum / positive_count.clamp(min=1).unsqueeze(1)) - \
             (negative_sum / negative_count.clamp(min=1).unsqueeze(1))

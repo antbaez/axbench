@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -p mit_preemptable
-#SBATCH --gres=gpu:h200:1
+#SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
 #SBATCH --mem=100G
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --requeue
 #SBATCH --output=logs/out/%j.out
 #SBATCH --error=logs/err/%j.err

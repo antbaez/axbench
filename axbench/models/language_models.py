@@ -4,14 +4,63 @@ from ..utils.constants import (
 )
 
 import httpx, asyncio
-import os, uuid, string, json, pickle
+import os, uuid, string, json, pickle, copy, random, threading, collections
 from pathlib import Path
+import openai
 
 import logging
 logging.basicConfig(format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
     datefmt='%Y-%m-%d:%H:%M:%S',
     level=logging.WARN)
 logger = logging.getLogger(__name__)
+
+
+class RequestLimiter(object):
+    """Caps in-flight API requests across threads that each run their own event loop.
+
+    asyncio.Semaphore is bound to a single loop and threading.Semaphore would block a
+    loop while it waits (stalling the requests that would free a slot), so a freed
+    slot is instead handed straight to the next waiter's loop.
+    """
+
+    def __init__(self, max_in_flight):
+        self._lock = threading.Lock()
+        self._free = max_in_flight
+        self._waiters = collections.deque()  # (loop, future)
+
+    async def acquire(self):
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._free > 0:
+                self._free -= 1
+                return
+            fut = loop.create_future()
+            self._waiters.append((loop, fut))
+        try:
+            await fut
+        except asyncio.CancelledError:
+            # cancelled after the slot was granted but before resuming: give it back
+            if fut.done() and not fut.cancelled():
+                self.release()
+            raise
+
+    def release(self):
+        with self._lock:
+            while self._waiters:
+                loop, fut = self._waiters.popleft()
+                try:
+                    loop.call_soon_threadsafe(self._grant, fut)
+                    return
+                except RuntimeError:
+                    continue  # that waiter's loop already closed
+            self._free += 1
+
+    def _grant(self, fut):
+        if fut.cancelled():
+            self.release()
+        else:
+            fut.set_result(None)
+
 
 def is_first_char_punctuation(s):
     if s and s[0] in string.punctuation:
@@ -32,8 +81,14 @@ class LanguageModelStats(object):
         self.prompt_cache = {}
         self.total_call = 0
         self.total_cache_hit = 0
+        # shared by LanguageModel.fork() copies running on other threads
+        self._lock = threading.Lock()
 
     def record(self, api_name, stats, prompt=None, completion=None):
+        with self._lock:
+            self._record(api_name, stats, prompt, completion)
+
+    def _record(self, api_name, stats, prompt, completion):
         self.total_call += 1
         if stats is None:
              self.total_cache_hit += 1
@@ -77,7 +132,7 @@ class LanguageModelStats(object):
         input_tokens, output_tokens = self.get_total_tokens()
         input_price = (input_tokens/UNIT_1M)*\
             PRICING_DOLLAR_PER_1M_TOKEN[self.model]["input"]
-        output_price = (input_tokens/UNIT_1M)*\
+        output_price = (output_tokens/UNIT_1M)*\
             PRICING_DOLLAR_PER_1M_TOKEN[self.model]["output"]
         return input_price + output_price
     
@@ -116,6 +171,10 @@ class LanguageModel(object):
         self.cache_level = cache_level
         self.cache_in_mem = {}
         self.api_count = {}
+        # optional RequestLimiter shared by every fork(), and how many extra times to
+        # retry a 429 after the OpenAI client's own (short, capped) retries give up
+        self.request_limiter = kwargs.get("request_limiter", None)
+        self.rate_limit_retries = kwargs.get("rate_limit_retries", 0)
         if self.use_cache:
             assert kwargs.get("master_data_dir", None), "master_data_dir is required for cache"
             self.cache_dir = Path(kwargs["master_data_dir"]) / "persist_lm_cache"
@@ -128,6 +187,17 @@ class LanguageModel(object):
             if self.cache_file.exists():
                 with open(self.cache_file, "rb") as f:
                     self.cache_in_mem = pickle.load(f)
+
+    def fork(self, client):
+        """A copy for use on another thread.
+
+        Gets its own client, because an httpx client is tied to the event loop it runs
+        on, but shares stats, cache and request limiter with the original.
+        """
+        forked = copy.copy(self)
+        forked.client = client
+        forked.api_count = {}
+        return forked
 
     def normalize(self, text):
         return text.strip()
@@ -145,8 +215,7 @@ class LanguageModel(object):
             cache_key = self._get_cache_key(prompt, api_count, api_name)
             if cache_key in self.cache_in_mem:
                 return (self.cache_in_mem[cache_key], None)
-        raw_completion = await client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}], model=self.model, temperature=self.temperature)
+        raw_completion = await self._create_completion(client, prompt)
         raw_completion = raw_completion.to_dict()
         completion = self.normalize(raw_completion["choices"][0]["message"]["content"])
 
@@ -155,6 +224,26 @@ class LanguageModel(object):
         usage = raw_completion['usage']
         return (completion, usage)
         
+    async def _create_completion(self, client, prompt):
+        """One API call, holding a limiter slot only while the request is in flight."""
+        for attempt in range(self.rate_limit_retries + 1):
+            if self.request_limiter is not None:
+                await self.request_limiter.acquire()
+            try:
+                return await client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}], model=self.model, temperature=self.temperature)
+            except openai.RateLimitError as e:
+                # running out of credit is also a 429, but waiting won't fix it
+                if attempt == self.rate_limit_retries or getattr(e, "code", None) == "insufficient_quota":
+                    raise
+            finally:
+                if self.request_limiter is not None:
+                    self.request_limiter.release()
+            delay = min(60, 2 ** attempt) * random.uniform(1, 1.5)
+            logger.warning(f"Rate limited; retrying in {delay:.1f}s "
+                           f"(attempt {attempt + 1}/{self.rate_limit_retries}).")
+            await asyncio.sleep(delay)
+
     async def chat_completions(self, api_names, prompts, batch_size=64):
         """handling batched async calls with internal batching mechanism"""
         # Ensure api_names is a list of appropriate length

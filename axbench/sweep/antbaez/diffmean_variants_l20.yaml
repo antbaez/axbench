@@ -2,8 +2,10 @@ generate:
   lm_model: "gpt-4o-mini"
   output_length: 128
   num_of_examples: 144
+  # one pool of base instructions, shared by every concept and every stage
+  num_base_instructions: 72
   concept_path: "axbench/data/gemma-2-9b-it_20-gemmascope-res-131k.json"
-  max_concepts: 100
+  max_concepts: 500
   master_data_dir: "axbench/data"
   dataset_category: "instruction"
   lm_use_cache: false
@@ -44,7 +46,7 @@ inference:
   # steering related params
   steering_intervention_type: "addition" # clamping
   steering_model_name: "google/gemma-2-9b-it"
-  steering_datasets: ["AlpacaEval"]
+  steering_datasets: ["ContrastInstructions"]
   steering_batch_size: 140
   steering_output_length: 128
   steering_layers: [20]
@@ -54,6 +56,7 @@ inference:
   master_data_dir: "axbench/data"
   seed: 42
   lm_model: "gpt-4o-mini"
+  lm_use_cache: false
   # generation related params
   temperature: 1.0
 evaluate:

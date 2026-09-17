@@ -16,12 +16,22 @@ import random
 import json
 import csv
 import atexit
+import threading
 import torch
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from axbench.utils.dataset import DatasetFactory
+from axbench.utils.dataset import (
+    CONTRASTIVE_CONCEPTS_FILE,
+    DatasetFactory,
+    load_base_instructions,
+    load_or_create_base_instructions,
+    load_contrastive_concepts,
+    load_or_create_contrastive_concepts_batch,
+)
+from axbench.models.language_models import RequestLimiter
 from args.dataset_args import DatasetArgs
 from pathlib import Path
 from openai import AsyncOpenAI
@@ -43,8 +53,28 @@ model_name_map = {
 
 MAX_RETRIES = 5
 RETRY_DELAY = 1  # in seconds
+# extra 429 retries (exponential backoff, capped at ~60s) beyond the OpenAI client's own
+RATE_LIMIT_RETRIES = 8
 STATE_FILE = "generate_state.pkl"
 METADATA_FILE = "metadata.jsonl"
+PREVIEW_FILE = "train_data_preview.json"
+PREVIEW_CONCEPTS = 10
+PREVIEW_PAIRS = 10
+
+
+def make_openai_client():
+    return AsyncOpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        timeout=60.0,
+        http_client=httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_keepalive_connections=100,
+                max_connections=1000
+            ),
+            headers={"Connection": "close"},
+        ),
+        max_retries=3,
+    )
 
 
 def load_concepts(dump_dir):
@@ -187,6 +217,37 @@ def save(
     combined_df.to_json(json_path, orient="records", indent=2, force_ascii=False)
 
 
+def save_preview(dump_dir, partition):
+    """First PREVIEW_PAIRS positive/negative pairs of the first PREVIEW_CONCEPTS concepts.
+
+    A small file for eyeballing data quality early in a run, instead of the full
+    {partition}_data.json. Built from the saved parquet, so it comes out the same
+    whether or not the run was resumed along the way.
+    """
+    # concept ids below the parquet rotation size all live in the first file
+    df = pd.read_parquet(os.path.join(dump_dir, f"{partition}_data.parquet"))
+    df = df[df["concept_id"] >= 0]
+    preview = []
+    for concept_id in sorted(df["concept_id"].unique())[:PREVIEW_CONCEPTS]:
+        rows = df[df["concept_id"] == concept_id]
+        positives = rows[rows["category"] == "positive"]
+        negatives = rows[rows["category"] == "negative"]
+        # create_train_df emits each negative in the same order as the positive it edits
+        pairs = [
+            {"positive": positive, "negative": negative, "contrast_concept": contrast_concept}
+            for positive, negative, contrast_concept in zip(
+                positives["input"], negatives["input"], negatives["contrast_concept"])
+        ][:PREVIEW_PAIRS]
+        preview.append({
+            "concept_id": int(concept_id),
+            "concept": positives["output_concept"].iloc[0],
+            "pairs": pairs,
+        })
+    with open(os.path.join(dump_dir, PREVIEW_FILE), "w") as f:
+        json.dump(preview, f, indent=2, ensure_ascii=False)
+    logger.warning(f"Wrote {PREVIEW_FILE} with {len(preview)} concept(s).")
+
+
 def load_state(dump_dir):
     """
     Load the state from a file if it exists.
@@ -205,6 +266,19 @@ def load_state(dump_dir):
     return None
 
 
+def count_metadata_entries(dump_dir):
+    """How many concepts have already been written, i.e. the next data concept_id.
+
+    One metadata line is appended per concept that produced data, so this stays correct
+    across resumes even when concepts in between were skipped by the genre filter.
+    """
+    metadata_path = os.path.join(Path(dump_dir), METADATA_FILE)
+    if not os.path.exists(metadata_path):
+        return 0
+    with open(metadata_path) as f:
+        return sum(1 for line in f if line.strip())
+
+
 def load_state_latent(dump_dir, mode):
     """
     Load the state from a file if it exists.
@@ -216,21 +290,27 @@ def load_state_latent(dump_dir, mode):
     return None
 
 
-def create_data_latent(dataset_factory, metadata, concept_id, num_of_examples, args):
+def create_data_latent(
+        dataset_factory, metadata, concept_id, num_of_examples, args,
+        base_instructions, contrastive_concepts_store, lm_model=None, rng=None):
     # prepare concept related data.
     concept = metadata[concept_id]["concept"]
     sae_link = metadata[concept_id]["ref"]
     try:
-        sae_id = int(sae_link.split("/")[-1]) 
+        sae_id = int(sae_link.split("/")[-1])
     except:
         sae_id = 0
     concept_genres_map = metadata[concept_id]["concept_genres_map"]
-    # Same generation method as --mode training (create_train_df: concept-rewritten
-    # positives + contrastive minimal-edit negatives), sampled from the held-out "test"
-    # seed-instruction split so eval data doesn't leak from the training seed pool.
+    rng = rng or random
+    # Same builder as --mode training, drawing from the same shared stores: a random
+    # subset of the base instructions, and this concept's own stored contrast pool.
+    sampled_instructions = rng.sample(
+        base_instructions, min(num_of_examples, len(base_instructions)))
     current_df = dataset_factory.create_train_df(
-        concept, num_of_examples, concept_genres_map,
-        output_length=int(args.output_length), split="test")
+        concept, concept_genres_map, sampled_instructions,
+        contrastive_concepts_store[concept],
+        output_length=int(args.output_length),
+        lm_model=lm_model, rng=rng)
     current_df["concept_id"] = concept_id
     current_df["sae_link"] = sae_link
     current_df["sae_id"] = sae_id
@@ -265,7 +345,8 @@ def save_latent(
         combined_df = pd.concat([existing_df, current_df], ignore_index=True)
     else:
         combined_df = current_df
-    combined_df.to_parquet(df_path, index=False)
+    # atomic, so a preemption mid-write can't corrupt every concept saved so far
+    save_df_to_parquet_safely(combined_df, df_path)
 
 
 def generate_latent(generate_args, args):
@@ -313,19 +394,15 @@ def generate_latent(generate_args, args):
         logger.warning(f"Datasets for all concepts have been generated. Exiting.")
         return
 
-    # Create a new OpenAI client.
-    client = AsyncOpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        timeout=60.0,
-        http_client=httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_keepalive_connections=100,
-                max_connections=1000
-            ),
-            headers={"Connection": "close"},
-        ),
-        max_retries=3,
-    )
+    # Create a new OpenAI client (worker threads each make their own, see below).
+    # Concurrency settings come from the generate: section, as in --mode training.
+    client = make_openai_client()
+    num_workers = int(generate_args.num_workers or 1)
+    request_limiter = RequestLimiter(int(generate_args.max_concurrent_requests)) \
+        if generate_args.max_concurrent_requests else None
+    logger.warning(
+        f"Generating with {num_workers} worker(s), max concurrent requests: "
+        f"{generate_args.max_concurrent_requests or f'uncapped (up to {64 * num_workers})'}.")
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -335,23 +412,60 @@ def generate_latent(generate_args, args):
     # Load dataset factory for evals.
     dataset_factory = DatasetFactory(
         None, client, tokenizer, generate_args.dataset_category, None, None, dump_dir,
-        use_cache=True, master_data_dir=args.master_data_dir,
-        lm_model=args.lm_model, logger=logger, is_inference=True
+        use_cache=args.lm_use_cache, master_data_dir=args.master_data_dir,
+        lm_model=args.lm_model, logger=logger, is_inference=True,
+        request_limiter=request_limiter, rate_limit_retries=RATE_LIMIT_RETRIES,
     )
     atexit.register(dataset_factory.save_cache)
     atexit.register(dataset_factory.reset_stats)
 
-    progress_bar = tqdm(range(start_concept_id, len(metadata)), desc="Processing concept")
-    for start_idx in progress_bar:
-        concept_id = metadata[start_idx]["concept_id"]
-        current_df = create_data_latent(
-            dataset_factory, metadata, concept_id, num_of_examples, args)
+    # Both stores are written by --mode training; latent only reads them, so its
+    # prompts are built from the same instructions and contrast concepts as training's.
+    base_instructions = load_base_instructions(data_dir)
+    contrastive_concepts_store = load_contrastive_concepts(data_dir)
 
-        save_latent(dump_dir, concept_id, 'latent', current_df)
-        logger.info(f"Saved inference dataset for concept {concept_id} to latent_eval_data.parquet")
-        # After processing, save state
-        current_state = {'concept_id': concept_id}
-        save_state_latent(args.dump_dir, current_state, 'latent')
+    remaining_ids = range(start_concept_id, len(metadata))
+    # checked up front so a run that would fail does so before spending anything
+    missing = [metadata[i]["concept"] for i in remaining_ids
+               if metadata[i]["concept"] not in contrastive_concepts_store]
+    if missing:
+        raise KeyError(
+            f"{len(missing)} concept(s) missing from {CONTRASTIVE_CONCEPTS_FILE} "
+            f"(e.g. '{missing[0]}') -- it is written by --mode training, which must run first.")
+
+    thread_state = threading.local()
+
+    def generate_concept(idx):
+        # an httpx client is tied to the event loop it runs on, so each thread needs
+        # its own; stats, cache and request limiter stay shared.
+        if not hasattr(thread_state, "lm_model"):
+            thread_state.lm_model = dataset_factory.lm_model.fork(make_openai_client())
+        concept_id = metadata[idx]["concept_id"]
+        return create_data_latent(
+            dataset_factory, metadata, concept_id, num_of_examples, args,
+            base_instructions, contrastive_concepts_store,
+            lm_model=thread_state.lm_model,
+            # seeded by concept rather than drawn from the global RNG, so the sampled
+            # instructions don't depend on thread timing or where a resume started
+            rng=random.Random(f"{args.seed}:latent:{concept_id}"))
+
+    executor = ThreadPoolExecutor(max_workers=num_workers)
+    futures = {idx: executor.submit(generate_concept, idx) for idx in remaining_ids}
+    try:
+        # Workers finish in any order; results are saved strictly in concept order,
+        # which the appended parquet and the single resume watermark rely on.
+        for idx in tqdm(remaining_ids, desc="Processing concept"):
+            concept_id = metadata[idx]["concept_id"]
+            current_df = futures.pop(idx).result()
+
+            save_latent(dump_dir, concept_id, 'latent', current_df)
+            logger.info(f"Saved inference dataset for concept {concept_id} to latent_eval_data.parquet")
+            # The next concept to generate -- saving this one's id made every resume
+            # regenerate it and append its rows a second time.
+            save_state_latent(args.dump_dir, {'concept_id': idx + 1}, 'latent')
+    finally:
+        # on failure, drop queued concepts; ones already running finish and are discarded
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def generate_training(args, generate_args):
@@ -360,13 +474,13 @@ def generate_training(args, generate_args):
     dump_dir.mkdir(parents=True, exist_ok=True)
 
     concept_path = args.concept_path
-    num_of_examples = args.num_of_examples
+    num_base_instructions = args.num_base_instructions
     max_concepts = args.max_concepts
 
     # Load and optionally shuffle concepts
     set_seed(args.seed)
     all_concepts, all_refs = load_concepts(concept_path)
-    
+
     # Limit the number of concepts if specified
     if max_concepts is not None:
         combined = list(zip(all_concepts, all_refs))
@@ -374,7 +488,7 @@ def generate_training(args, generate_args):
         all_concepts, all_refs = zip(*combined)
         all_concepts = list(all_concepts)[:max_concepts]
         all_refs = list(all_refs)[:max_concepts]
-    
+
     concept2id = {concept: i for i, concept in enumerate(all_concepts)}
     concepts = list(zip(all_concepts, all_refs))
 
@@ -386,19 +500,14 @@ def generate_training(args, generate_args):
         logger.warning(f"Datasets for all concepts have been generated. Exiting.")
         return
 
-    # Create a new OpenAI client.
-    client = AsyncOpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        timeout=60.0,
-        http_client=httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_keepalive_connections=100, 
-                max_connections=1000
-            ),
-            headers={"Connection": "close"},
-        ),
-        max_retries=3,
-    )
+    # Create a new OpenAI client (worker threads each make their own, see below).
+    client = make_openai_client()
+    num_workers = int(args.num_workers or 1)
+    request_limiter = RequestLimiter(int(args.max_concurrent_requests)) \
+        if args.max_concurrent_requests else None
+    logger.warning(
+        f"Generating with {num_workers} worker(s), max concurrent requests: "
+        f"{args.max_concurrent_requests or f'uncapped (up to {64 * num_workers})'}.")
 
     # Load lm and tokenizer.
     model_name = model_name_map[all_refs[0].split("/")[3]]
@@ -428,49 +537,90 @@ def generate_training(args, generate_args):
 
     # Init the dataset factory.
     dataset_factory = DatasetFactory(
-        model, client, tokenizer, args.dataset_category, num_of_examples, args.output_length, 
+        model, client, tokenizer, args.dataset_category, args.num_of_examples, args.output_length,
         dump_dir, use_cache=args.lm_use_cache, master_data_dir=args.master_data_dir,
         seed=args.seed, lm_model=args.lm_model, start_concept_id=start_concept_id, is_chat_model=is_chat_model,
         include_system_prompt=include_system_prompt,
+        request_limiter=request_limiter, rate_limit_retries=RATE_LIMIT_RETRIES,
     )
     atexit.register(dataset_factory.save_cache)
     atexit.register(dataset_factory.reset_stats)
 
-    progress_bar = tqdm(range(start_concept_id, len(concepts)), desc="Processing concept")
-    only_one_concept = True if len(concepts) == 1 else False
-    data_concept_id = start_concept_id
-    for concept_id in progress_bar:
-        concept, ref = concepts[concept_id]
-        print(f"Generating for concept: {concept}...")
+    # The one base-instruction pool every concept and every later stage builds on.
+    base_instructions = load_or_create_base_instructions(
+        dump_dir, dataset_factory.seed_instructions, num_base_instructions)
 
-        # prepare concept related data.
-        concept_genres_map = \
-            dataset_factory.prepare_genre_concepts([concept])
-        genre = concept_genres_map[concept][0]
-        if genre != "text":
-            logger.info(f"Skipping concept '{concept}' (genre={genre}); only generating text data.")
-            with open(os.path.join(dump_dir, STATE_FILE), "wb") as f:
-                pickle.dump({"concept_id": concept_id + 1}, f)
-            continue
-        # generate with retry mechanism.
-        # try:
-        current_df = dataset_factory.create_train_df(
-            concept, num_of_examples, concept_genres_map,
+    remaining_ids = range(start_concept_id, len(concepts))
+    only_one_concept = True if len(concepts) == 1 else False
+
+    # Genres and contrast pools for every remaining concept up front: one batched pass
+    # each instead of two sequential round trips per concept, and the contrast store is
+    # written here once rather than concurrently by the workers below.
+    concept_genres_map = dataset_factory.prepare_genre_concepts(
+        [concepts[i][0] for i in remaining_ids])
+    text_ids = [i for i in remaining_ids if concept_genres_map[concepts[i][0]][0] == "text"]
+    contrastive_concepts_map = load_or_create_contrastive_concepts_batch(
+        dataset_factory.lm_model, [concepts[i][0] for i in text_ids], dump_dir)
+
+    thread_state = threading.local()
+
+    def generate_concept(concept_id):
+        # an httpx client is tied to the event loop it runs on, so each thread needs
+        # its own; stats, cache and request limiter stay shared.
+        if not hasattr(thread_state, "lm_model"):
+            thread_state.lm_model = dataset_factory.lm_model.fork(make_openai_client())
+        concept = concepts[concept_id][0]
+        return dataset_factory.create_train_df(
+            concept, concept_genres_map, base_instructions, contrastive_concepts_map[concept],
             output_length=args.output_length,
-            current_concept_id=data_concept_id,
             only_one_concept=only_one_concept,
+            lm_model=thread_state.lm_model,
+            # seeded by concept rather than drawn from the global RNG, so contrast
+            # assignment doesn't depend on thread timing or where a resume started
+            rng=random.Random(f"{args.seed}:{concept_id}"),
         )
-        current_df["concept_id"] = data_concept_id
-        # except Exception as e:
-        #     logger.warning(f"Failed to create training data for group {concept_id}: {e}")
-        #     continue # continue to the next group.
-        
-        # Save the generated DataFrame, metadata, and current state
-        save(
-            dump_dir, {"concept_id": concept_id + 1}, data_concept_id,
-            concept, concept_genres_map, 
-            ref, "train", current_df, dataset_factory)
-        data_concept_id += 1
+
+    # Counts concepts that actually produced data, which is not the loop index once
+    # non-text concepts are skipped. Derived from the metadata written so far rather
+    # than from start_concept_id, so a resume after skips can't leave gaps in
+    # concept_id -- it indexes the weight tensors and max_act lookups downstream.
+    data_concept_id = count_metadata_entries(dump_dir)
+    executor = ThreadPoolExecutor(max_workers=num_workers)
+    futures = {i: executor.submit(generate_concept, i) for i in text_ids}
+    try:
+        # Workers finish in any order; results are saved strictly in concept order,
+        # which the appended metadata/parquet, data_concept_id and the single
+        # resume watermark in STATE_FILE all rely on.
+        for concept_id in tqdm(remaining_ids, desc="Processing concept"):
+            concept, ref = concepts[concept_id]
+            genre = concept_genres_map[concept][0]
+            if genre != "text":
+                logger.info(f"Skipping concept '{concept}' (genre={genre}); only generating text data.")
+                with open(os.path.join(dump_dir, STATE_FILE), "wb") as f:
+                    pickle.dump({"concept_id": concept_id + 1}, f)
+                continue
+            # every stage shares one text-genre instruction pool, so anything else would
+            # silently be paired with instructions from the wrong genre.
+            assert genre == "text", f"non-text concept '{concept}' reached generation"
+
+            current_df = futures.pop(concept_id).result()
+            current_df["concept_id"] = data_concept_id
+
+            # Save the generated DataFrame, metadata, and current state
+            save(
+                dump_dir, {"concept_id": concept_id + 1}, data_concept_id,
+                concept, {concept: concept_genres_map[concept]},
+                ref, "train", current_df, dataset_factory)
+            data_concept_id += 1
+            if data_concept_id == PREVIEW_CONCEPTS:
+                save_preview(dump_dir, "train")
+    finally:
+        # on failure, drop queued concepts; ones already running finish and are discarded
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    # fewer than PREVIEW_CONCEPTS text concepts in total: preview whatever there is
+    if data_concept_id > 0 and not os.path.exists(os.path.join(dump_dir, PREVIEW_FILE)):
+        save_preview(dump_dir, "train")
 
     logger.warning(f"Finished creating dataset.")
 
@@ -573,18 +723,7 @@ def generate_dpo_training(args, inference_args):
         return
 
     # Create a new OpenAI client.
-    client = AsyncOpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        timeout=60.0,
-        http_client=httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_keepalive_connections=100, 
-                max_connections=1000
-            ),
-            headers={"Connection": "close"},
-        ),
-        max_retries=3,
-    )
+    client = make_openai_client()
 
     # Init the dataset factory.
     dataset_factory = DatasetFactory(
