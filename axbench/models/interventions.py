@@ -1060,8 +1060,10 @@ class PositionwisePromptAdditionIntervention(
     DistributedRepresentationIntervention
 ):
     """
-    End-aligned, prefill-only steering: v_0 is added to the final prompt token,
-    v_1 to the token before it, and so on for num_positions positions.
+    End-aligned, prefill-only steering: the stack is stored in column order, so
+    slot -1 is added to the final prompt token, slot -2 to the token before it, and so
+    on for num_positions positions. This is the same order DiffMeanPositional.train
+    extracts them in, so nothing is reordered between training and inference.
 
     Weights are [n_concepts, num_positions, embed_dim] rather than the
     [n_concepts, embed_dim] that AdditionIntervention/PromptAdditionIntervention
@@ -1090,8 +1092,9 @@ class PositionwisePromptAdditionIntervention(
         n = min(self.num_positions, base.shape[1])
 
         # generation input is left-padded, so the last prompt token is column -1 for
-        # every row; flip so v_0 lands there and v_k lands k columns earlier.
-        steering_vec = torch.flip(v[:, :n], dims=[1]) * scale
+        # every row; slot -1 lands there. Slicing from the end keeps that alignment
+        # when the batch is narrower than num_positions (the leading slots are dropped).
+        steering_vec = v[:, -n:] * scale
         delta = torch.zeros_like(base)
         delta[:, -n:] = steering_vec.to(base.dtype)
         return base + delta

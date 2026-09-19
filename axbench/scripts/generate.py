@@ -60,6 +60,9 @@ METADATA_FILE = "metadata.jsonl"
 PREVIEW_FILE = "train_data_preview.json"
 PREVIEW_CONCEPTS = 10
 PREVIEW_PAIRS = 10
+SELECTED_CONCEPTS_FILE = "selected_concepts.json"
+# concept names classified per genre LLM call while filling up to max_concepts
+GENRE_BATCH_SIZE = 256
 
 
 def make_openai_client():
@@ -279,11 +282,108 @@ def count_metadata_entries(dump_dir):
         return sum(1 for line in f if line.strip())
 
 
+def sae_index(ref):
+    """Feature index from a neuronpedia ref (.../<model>/<sae>/<index>), or None."""
+    try:
+        return int(str(ref).rstrip("/").split("/")[-1])
+    except ValueError:
+        return None
+
+
+def select_text_concepts(all_concepts, all_refs, max_concepts, seed,
+                         seed_concepts_dir, dataset_factory, dump_dir):
+    """
+    Pick the text-genre concepts to generate for: up to max_concepts of them.
+
+    Text concepts from seed_concepts_dir (a prior run's generate/ dir, e.g. concept500)
+    come first, in their original order and with the genres that run recorded. The rest
+    are filled from a seeded shuffle of the full concept pool, genre-classified in
+    batches until max_concepts text concepts are found. Every seed concept is excluded
+    from the fill whatever its genre, so the seed run's verdict stands -- re-asking the
+    genre model could flip a code concept to text.
+
+    Genre labels come from a temperature-1.0 LLM call, so the choice is written to
+    SELECTED_CONCEPTS_FILE once and reloaded on every later run; recomputing it on a
+    resume could hand back a different concept list than the one already half-generated.
+    """
+    path = os.path.join(dump_dir, SELECTED_CONCEPTS_FILE)
+    if os.path.exists(path):
+        with open(path) as f:
+            selected = json.load(f)["concepts"]
+        logger.warning(f"Loaded {len(selected)} concepts from {path}.")
+        return selected
+
+    selected, taken, taken_refs = [], set(), set()
+    if seed_concepts_dir:
+        for row in load_metadata_flatten(seed_concepts_dir):
+            concept, genres = row["concept"], row["concept_genres_map"][row["concept"]]
+            taken.add(concept)
+            taken_refs.add(row["ref"])
+            if genres[0] == "text" and (max_concepts is None or len(selected) < max_concepts):
+                selected.append({"concept": concept, "ref": row["ref"],
+                                 "genres": genres, "source": "seed"})
+        logger.warning(
+            f"{len(selected)} text concepts taken from {seed_concepts_dir} "
+            f"({len(taken)} seed concepts excluded from the random fill).")
+
+    # Same seeded shuffle of the full pool that the old slice-then-filter code used, so
+    # with a concept500 seed the fill continues where concept500's own sample stopped.
+    pool = list(zip(all_concepts, all_refs))
+    random.Random(seed).shuffle(pool)
+    pool = [(c, r) for c, r in pool if c not in taken and r not in taken_refs]
+
+    n_classified, i = 0, 0
+    while (max_concepts is None or len(selected) < max_concepts) and i < len(pool):
+        # distinct features can share a description, and every downstream map is keyed
+        # by the description, so a repeat would collide with the concept already taken
+        batch = []
+        while len(batch) < GENRE_BATCH_SIZE and i < len(pool):
+            concept, ref = pool[i]
+            i += 1
+            if concept not in taken:
+                taken.add(concept)
+                batch.append((concept, ref))
+        if not batch:
+            break
+        genres_map = dataset_factory.prepare_genre_concepts([c for c, _ in batch])
+        n_classified += len(batch)
+        for concept, ref in batch:
+            if genres_map[concept][0] != "text":
+                continue
+            selected.append({"concept": concept, "ref": ref,
+                             "genres": genres_map[concept], "source": "random"})
+            if max_concepts is not None and len(selected) >= max_concepts:
+                break
+    if max_concepts is not None and len(selected) < max_concepts:
+        logger.warning(
+            f"Only {len(selected)} text concepts available, fewer than max_concepts="
+            f"{max_concepts}; continuing with those.")
+
+    for concept_id, entry in enumerate(selected):
+        entry["concept_id"] = concept_id
+        entry["sae_index"] = sae_index(entry["ref"])
+    n_seed = sum(e["source"] == "seed" for e in selected)
+    with open(path, "w") as f:
+        json.dump({
+            "max_concepts": max_concepts,
+            "seed": seed,
+            "seed_concepts_dir": seed_concepts_dir,
+            "n_from_seed": n_seed,
+            "n_random": len(selected) - n_seed,
+            "n_genre_classified": n_classified,
+            "concepts": selected,
+        }, f, indent=2, ensure_ascii=False)
+    logger.warning(
+        f"Selected {len(selected)} text concepts ({n_seed} from seed, "
+        f"{len(selected) - n_seed} random after classifying {n_classified}); wrote {path}.")
+    return selected
+
+
 def load_state_latent(dump_dir, mode):
     """
     Load the state from a file if it exists.
     """
-    state_path = os.path.join(f"{dump_dir}/inference", f"{mode}_{STATE_FILE}")
+    state_path = os.path.join(f"{dump_dir}/generate", f"{mode}_{STATE_FILE}")
     if os.path.exists(state_path):
         with open(state_path, "rb") as f:
             return pickle.load(f)
@@ -318,7 +418,7 @@ def create_data_latent(
 
 
 def save_state_latent(dump_dir, state, partition):
-    dump_dir = Path(dump_dir) / "inference"
+    dump_dir = Path(dump_dir) / "generate"
     dump_dir.mkdir(parents=True, exist_ok=True)
     # Save state
     state_path = os.path.join(dump_dir, f"{partition}_{STATE_FILE}")
@@ -330,7 +430,7 @@ def save_latent(
     dump_dir, concept_id, partition,
     current_df):
     # This function saves DataFrames per rank per partition (latent or steering)
-    dump_dir = Path(dump_dir) / "inference"
+    dump_dir = Path(dump_dir) / "generate"
     dump_dir.mkdir(parents=True, exist_ok=True)
     
     # Save DataFrame using Parquet
@@ -477,28 +577,20 @@ def generate_training(args, generate_args):
     num_base_instructions = args.num_base_instructions
     max_concepts = args.max_concepts
 
-    # Load and optionally shuffle concepts
     set_seed(args.seed)
     all_concepts, all_refs = load_concepts(concept_path)
 
-    # Limit the number of concepts if specified
-    if max_concepts is not None:
-        combined = list(zip(all_concepts, all_refs))
-        random.shuffle(combined)
-        all_concepts, all_refs = zip(*combined)
-        all_concepts = list(all_concepts)[:max_concepts]
-        all_refs = list(all_refs)[:max_concepts]
-
-    concept2id = {concept: i for i, concept in enumerate(all_concepts)}
-    concepts = list(zip(all_concepts, all_refs))
-
-    # Load the state if it exists.
+    # The resume watermark in STATE_FILE is a position in the selected list. A dump
+    # written before SELECTED_CONCEPTS_FILE existed indexed a different, mixed-genre
+    # list, so resuming it here would silently skip or repeat concepts.
     state = load_state(dump_dir)
+    if state and not os.path.exists(os.path.join(dump_dir, SELECTED_CONCEPTS_FILE)):
+        raise RuntimeError(
+            f"{dump_dir} has a {STATE_FILE} but no {SELECTED_CONCEPTS_FILE}: it was written "
+            f"by the old slice-then-filter concept selection and can't be resumed. Use a "
+            f"fresh --dump_dir.")
     start_concept_id = state.get("concept_id", 0) if state else 0
     logger.warning(f"Starting concept index: {start_concept_id}")
-    if start_concept_id >= len(concepts):
-        logger.warning(f"Datasets for all concepts have been generated. Exiting.")
-        return
 
     # Create a new OpenAI client (worker threads each make their own, see below).
     client = make_openai_client()
@@ -550,15 +642,22 @@ def generate_training(args, generate_args):
     base_instructions = load_or_create_base_instructions(
         dump_dir, dataset_factory.seed_instructions, num_base_instructions)
 
+    selected = select_text_concepts(
+        all_concepts, all_refs, max_concepts, args.seed,
+        getattr(args, "seed_concepts_dir", None), dataset_factory, str(dump_dir))
+    concepts = [(e["concept"], e["ref"]) for e in selected]
+    concept_genres_map = {e["concept"]: e["genres"] for e in selected}
+    if start_concept_id >= len(concepts):
+        logger.warning(f"Datasets for all concepts have been generated. Exiting.")
+        return
+
     remaining_ids = range(start_concept_id, len(concepts))
     only_one_concept = True if len(concepts) == 1 else False
 
-    # Genres and contrast pools for every remaining concept up front: one batched pass
-    # each instead of two sequential round trips per concept, and the contrast store is
-    # written here once rather than concurrently by the workers below.
-    concept_genres_map = dataset_factory.prepare_genre_concepts(
-        [concepts[i][0] for i in remaining_ids])
-    text_ids = [i for i in remaining_ids if concept_genres_map[concepts[i][0]][0] == "text"]
+    # Contrast pools for every remaining concept up front: one batched pass instead of
+    # a round trip per concept, and the store is written here once rather than
+    # concurrently by the workers below.
+    text_ids = list(remaining_ids)
     contrastive_concepts_map = load_or_create_contrastive_concepts_batch(
         dataset_factory.lm_model, [concepts[i][0] for i in text_ids], dump_dir)
 
@@ -580,10 +679,10 @@ def generate_training(args, generate_args):
             rng=random.Random(f"{args.seed}:{concept_id}"),
         )
 
-    # Counts concepts that actually produced data, which is not the loop index once
-    # non-text concepts are skipped. Derived from the metadata written so far rather
-    # than from start_concept_id, so a resume after skips can't leave gaps in
-    # concept_id -- it indexes the weight tensors and max_act lookups downstream.
+    # Counts concepts that actually produced data. The selected list is text-only, so
+    # this now equals the loop index, but deriving it from the metadata written so far
+    # keeps concept_id gap-free even if a save and the state watermark ever disagree --
+    # it indexes the weight tensors and max_act lookups downstream.
     data_concept_id = count_metadata_entries(dump_dir)
     executor = ThreadPoolExecutor(max_workers=num_workers)
     futures = {i: executor.submit(generate_concept, i) for i in text_ids}
@@ -594,11 +693,6 @@ def generate_training(args, generate_args):
         for concept_id in tqdm(remaining_ids, desc="Processing concept"):
             concept, ref = concepts[concept_id]
             genre = concept_genres_map[concept][0]
-            if genre != "text":
-                logger.info(f"Skipping concept '{concept}' (genre={genre}); only generating text data.")
-                with open(os.path.join(dump_dir, STATE_FILE), "wb") as f:
-                    pickle.dump({"concept_id": concept_id + 1}, f)
-                continue
             # every stage shares one text-genre instruction pool, so anything else would
             # silently be paired with instructions from the wrong genre.
             assert genre == "text", f"non-text concept '{concept}' reached generation"

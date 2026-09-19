@@ -273,8 +273,9 @@ T_GENERATE_CONTRASTIVE_CONCEPTS = """Given the concept:
 
 Your task is to:
 
-1. Generate a list of 10 different concepts that are related to '{CONCEPT}' (e.g. share a topic, domain, or surface-level word overlap) but are conceptually distinct from it.
-2. Each concept should be specific enough to meaningfully differ from '{CONCEPT}', not just a rewording of it.
+1. Generate a list of 10 concepts that are unrelated to '{CONCEPT}'. They should not share its topic, domain, or any surface-level word overlap.
+2. Make the 10 concepts diverse: draw each from a different domain, so they are unrelated to one another as well as to '{CONCEPT}'.
+3. Write each one in the same format as '{CONCEPT}' -- mirror its phrasing pattern, grammatical structure, approximate length, level of specificity, and capitalization, so that the only thing that differs is the subject matter.
 
 **Formatting Guidelines:**
 

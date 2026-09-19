@@ -558,10 +558,12 @@ class LastTokenDiffMean(MeanTokenDiffMean):
 class DiffMeanPositional(MeanTokenDiffMean):
     """One DiffMean direction per end-aligned token position.
 
-    Training indexes backward from the last real token of the (instruction + response)
-    sequence. At inference the vectors are applied end-aligned to the *prompt* -- v_0 on
-    the final prompt token, v_1 on the one before it -- and generation is left unsteered.
-    Note the asymmetry: "the end" is end-of-response in training but end-of-prompt at test.
+    Training takes the last num_positions columns of each left-padded, chat-templated
+    prompt (ending in the generation-prompt header). The stack is stored in column order:
+    slot -1 is the final token, slot -2 the one before it, and so on. At inference the
+    stack is applied end-aligned to the steering prompt with the same order (slot -1 on
+    the final prompt token), so no reordering happens anywhere, and generation is left
+    unsteered.
 
     Deliberate design choice: position k's mean is *not* restricted to examples long
     enough to have a real, non-prefix token k back. Every example in the batch
@@ -632,21 +634,24 @@ class DiffMeanPositional(MeanTokenDiffMean):
                     {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
                 ).detach().float()
                 labels = inputs["labels"]
+                is_positive = labels == 1
+                is_negative = labels != 1
 
-                for k in range(min(num_positions, activations.shape[1])):
-                    # position k back from the end. Every row contributes here
-                    # regardless of whether column (seq_len-1-k) is real content,
-                    # still inside the chat-template prefix, or left-padding for that
-                    # particular row -- deliberately unmasked, so deep positions keep
-                    # pooling over the full batch instead of only whichever examples
-                    # happen to be long enough to have a real token that far back.
-                    acts_k = activations[:, activations.shape[1] - 1 - k, :]
-                    is_positive = labels == 1
-                    is_negative = labels != 1
-                    positive_sum[k] += acts_k[is_positive].sum(dim=0)
-                    negative_sum[k] += acts_k[is_negative].sum(dim=0)
-                    positive_count[k] += is_positive.sum()
-                    negative_count[k] += is_negative.sum()
+                # Column order: the last n columns of the left-padded batch, left to
+                # right, land in the last n slots, so slot -1 is the final token for
+                # every row. When the batch is narrower than num_positions, the
+                # leading slots get nothing and stay zero. Every row contributes at
+                # every slot regardless of whether that column is real content, still
+                # inside the chat-template prefix, or left-padding for that particular
+                # row -- deliberately unmasked, so deep positions keep pooling over the
+                # full batch instead of only whichever examples happen to be long
+                # enough to have a real token that far back.
+                n = min(num_positions, activations.shape[1])
+                acts = activations[:, -n:, :]
+                positive_sum[-n:] += acts[is_positive].sum(dim=0)
+                negative_sum[-n:] += acts[is_negative].sum(dim=0)
+                positive_count[-n:] += is_positive.sum()
+                negative_count[-n:] += is_negative.sum()
 
         empty = ((positive_count == 0) | (negative_count == 0)).nonzero().flatten().tolist()
         if empty:
@@ -677,8 +682,10 @@ class DiffMeanPositional(MeanTokenDiffMean):
         model_name = kwargs.get("model_name", self.__str__())
         weight_file = dump_dir / f"{model_name}_weight.pt"
         weight = {
-            "collapsed": self.ax.proj.weight.data.cpu(),                    # 1, h
-            "positional": self.positional_weight.data.cpu().unsqueeze(0),   # 1, num_positions, h
+            "collapsed": self.ax.proj.weight.data.cpu(),                        # 1, h
+            # column order (slot -1 = final token). Named distinctly from the old
+            # reversed-order "positional" key so a stale checkpoint can't load silently.
+            "positional_col": self.positional_weight.data.cpu().unsqueeze(0),   # 1, num_positions, h
         }
         if weight_file.exists():
             previous = torch.load(weight_file, weights_only=True)
@@ -696,11 +703,17 @@ class DiffMeanPositional(MeanTokenDiffMean):
         weight = torch.load(
             f"{dump_dir}/{model_name}_weight.pt", map_location=torch.device("cpu"), weights_only=True)
         if kwargs.get("mode") == "steering":
+            if "positional_col" not in weight:
+                raise ValueError(
+                    f"{dump_dir}/{model_name}_weight.pt has no 'positional_col' key. A "
+                    f"'positional' key means an older checkpoint whose stack is stored in "
+                    f"reverse (slot 0 = final token); applying it now would steer every "
+                    f"position with the wrong vector. Retrain DiffMeanPositional.")
             # derive both dims from the checkpoint so train and inference cannot disagree
-            kwargs["low_rank_dimension"] = weight["positional"].shape[0]
-            kwargs["num_positions"] = weight["positional"].shape[1]
+            kwargs["low_rank_dimension"] = weight["positional_col"].shape[0]
+            kwargs["num_positions"] = weight["positional_col"].shape[1]
             self.make_model(**kwargs)
-            self.ax.proj_weight.data = weight["positional"].to(self.device)
+            self.ax.proj_weight.data = weight["positional_col"].to(self.device)
         else:
             bias = torch.load(
                 f"{dump_dir}/{model_name}_bias.pt", map_location=torch.device("cpu"), weights_only=True)

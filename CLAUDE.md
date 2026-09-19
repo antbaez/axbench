@@ -47,21 +47,42 @@ with `generate:` / `train:` / `inference:` / `evaluate:` blocks. `generate.py` a
    concept — this is why every method needs a working latent path even if the
    real goal is only steering (§8). `--chunk`/`--num_chunks` split the concept-id
    space into deterministic, non-overlapping windows so N independent preemptable
-   jobs can each own a slice; `--merge_chunks` concatenates the chunk files into
-   the single `latent_data.parquet` (the specific filename matters — steering only
-   globs `latent_*.parquet`, which per-chunk files don't match), and
-   `--verify_chunks` fails loudly if any concept is missing or any model's
-   `{Model}_max_act` column is absent/null before steering is allowed to start. A
-   non-positive `max_act` is silently coerced to `50` downstream rather than left
-   as-is.
+   jobs can each own a slice. The last chunk to finish auto-merges them into the
+   single `latent_data.parquet` (`maybe_auto_merge_chunks`), so a separate
+   `--merge_chunks` pass is normally unnecessary — but the auto-merge swallows every
+   exception and only warns, so a chunk can exit 0 without the merge having happened.
+   Every merge (auto or `--merge_chunks`) is verified — full concept coverage, and
+   for latent a populated `{Model}_max_act` per model — before it replaces
+   `{mode}_data.parquet` via a temp file, so a failed or partial merge (e.g. two
+   chunks racing) never overwrites a good one. After a verified auto-merge the
+   `rank_*_{mode}_chunk*_data.parquet` files and their resume-state pickles are
+   deleted (manual `--merge_chunks` only deletes when `--verify_chunks` is also
+   passed); a chunk requeued afterwards sees its window already in the merged file
+   and exits instead of redoing it. To force a re-run, delete `{mode}_data.parquet`.
+   The exact filename matters: `pre_compute_mean_activations` reads
+   `latent_data.parquet` by name, deliberately not a `latent_*` glob, since older
+   dumps (and the released `concept500` data) keep `generate.py --mode latent`'s
+   `latent_eval_data.parquet` in that same `inference/` directory, and that file has
+   no `max_act` column. `generate.py --mode latent` now writes it to `generate/`
+   instead, so each stage writes only its own directory; `DatasetFactory` looks for
+   it in the `--overwrite_inference_data_dir` it is given, then in a sibling
+   `inference/`, and raises if neither has it. `--verify_chunks` (CPU-only, it
+   returns before any GPU work) fails loudly if a concept is missing or a model's
+   `{Model}_max_act` column is absent/null. A non-positive `max_act` is silently
+   coerced to `50` downstream rather than left as-is.
 
 4. **`inference.py --mode steering`** — generates concept-steered text: for every
    concept × eval prompt × configured steering factor, injects a learned
    direction into hidden states during generation. Requires latent mode's merged
-   `latent_data.parquet` first — if a concept's `max_act` is missing, `predict_steer`
-   silently falls back to a factor-scale multiplier of `1.0`, quietly changing what
-   every factor in the sweep means (§8). The actual injected magnitude is
-   `factor * max_act` (logged as `strength`). Which intervention module runs is
+   `latent_data.parquet` first; this is now a hard error rather than the silent
+   factor-scale fallback to `1.0` it used to be — `pre_compute_mean_activations`
+   raises `FileNotFoundError` if the file is absent, and `inference.py` then raises
+   `ValueError` naming any `concept_id` the merge doesn't cover (§8). The actual
+   injected magnitude is `factor * max_act` (logged as `strength`), so equal factors
+   are *not* equal magnitudes across models or concepts: `max_act` varies per
+   (concept, model), and which method gets pushed hardest at a given factor changes
+   from concept to concept. Compare methods at their own best factor, not at a shared
+   one. Which intervention module runs is
    picked once, globally, via the yaml's `steering_intervention_type` and applied
    to *every* model in the run: `"addition"` adds the scaled direction at every
    position (prompt and generated tokens alike); `"clamping"` projects the
@@ -112,11 +133,32 @@ with `generate:` / `train:` / `inference:` / `evaluate:` blocks. `generate.py` a
    `chunk_bounds()` logic `inference.py` uses (so both stages shard identically);
    `run_preemptable_evaluate_local.sh` self-resubmits one Slurm job per chunk with
    `--requeue`, and per-concept state pickles let a preempted chunk resume rather
-   than restart. `--merge_chunks` combines all `{mode}_chunk*` files into the
-   canonical `{mode}.jsonl`/`{mode}_data.parquet`, warning (not erroring) about any
-   concept still missing — running it before every chunk has finished silently
-   produces an incomplete merge. `steering` and `steering_test` chunks/merges are
-   entirely independent of each other.
+   than restart. The last chunk to finish auto-merges all `{mode}_chunk*` files into
+   the canonical `{mode}.jsonl`/`{mode}_data.parquet` (`--merge_chunks` does the same
+   by hand). The merge is refused — nothing replaced, nothing deleted — unless every
+   concept is present in the jsonl and the parquet covers the same concepts; once
+   verified, the chunk jsonl/parquet/state files and `temp_*_chunk*.pkl` are deleted,
+   and a chunk requeued afterwards exits before loading the judge if its window is
+   already in the merged `{mode}.jsonl`. `steering` and `steering_test` chunks/merges are
+   entirely independent of each other. For spot-checking, `lm_judge_local.py` dumps
+   the first 3 examples of each of the three judge types — full rendered prompt, raw
+   judge completion, parsed rating — once per process, so each chunk logs its own
+   first concept (9 blocks each). The parsed rating sits next to the raw completion
+   on purpose: the parser needs the literal string `Rating:` and otherwise falls back
+   to `0.0`, so format drift would otherwise read as uniformly terrible steering.
+
+6b. **`evaluate_short.py --mode steering|steering_test`** — a subsampled OpenAI-judge
+   variant of `evaluate.py` for quick, cheap looks. It reuses `evaluate.py`'s client
+   construction and the same `LMJudgeEvaluator`, so any cell it reports matches what
+   `evaluate.py` would give; only row selection and output format differ.
+   `--top_factors N` (the N largest factors, e.g. 4 → 2.5/3.0/4.0/5.0),
+   `--factor_stride N` (2 = alternating 7 of 14), `--examples_per_concept N` and
+   `--max_concepts N` each take a count or `all`; `--num_workers` runs judge calls
+   across threads, each with its own client. Writes `{mode}_short.json` (per-factor
+   means) and `{mode}_short_ratings.jsonl` (one line per judged generation, all raw
+   ratings) under `{dump}/evaluate/`, then prints a factor × model table and each
+   method's best factor. Needs no GPU — `evaluate.py` loads no local model when
+   `LMJudgeEvaluator` is the only steering evaluator.
 
 7. **`axbench/scripts/analyses.ipynb`** — turns evaluation output into the
    paper/leaderboard-style numbers.
@@ -172,8 +214,13 @@ the same `base.shape[1] <= 1` decode-step no-op described below — so it steers
 **`PositionwisePromptAdditionIntervention`** (`axbench/models/interventions.py`,
 renamed from `PositionwiseAdditionIntervention`): weight
 `[n_concepts, num_positions, hidden]` instead of the stock
-`AdditionIntervention`'s `[n_concepts, hidden]`-broadcast-to-all-positions. Applies
-`v_0` to the final prompt token, `v_k` k columns earlier. It suppresses itself on
+`AdditionIntervention`'s `[n_concepts, hidden]`-broadcast-to-all-positions. The stack
+is stored in **column order** (slot `-1` = final token, slot `-1-k` = k tokens back),
+the same order `DiffMeanPositional.train` slices it out of the left-padded batch, so
+inference just does `delta[:, -n:] = v[:, -n:]` with no flip. Checkpoints store it under
+the dict key `positional_col`; older checkpoints used `positional` in the reverse order
+(slot 0 = final token) and now raise on load rather than steering with reversed
+vectors. It suppresses itself on
 decode steps via `base.shape[1] <= 1` — stateless, so it stays correct across the
 batch loop in `predict_steer`, unlike a call counter which would need resetting per
 `generate()` call (a hook `Model.predict_steer` does not provide). Used by
@@ -217,11 +264,24 @@ drops off sharply with `k`.
 
 **Verification status.** Statically verified: everything compiles; the index math and
 the save → per-rank-merge → load round trip are unit-tested against the real shipped
-source. **Not yet run on a GPU** — the two checks that still matter are (a) `DiffMean`
-producing bit-identical weights before/after these edits, and (b) `MeanTokenDiffMean`
-matching `DiffMean` within bf16 noise (cosine > ~0.999). Check (b) is the empirical
-test of the RoPE assumption in §9 — if it fails, the left-padding premise is wrong,
-not just the code.
+source.
+
+**Now run end-to-end on GPU** (9B/L20, own `pos_steer_data` dataset): train → latent →
+steering all completed, producing 46,480 steering rows over 332 concepts × 10 prompts ×
+14 factors for all three variants. Steering demonstrably works and scales with the
+factor — a crude concept-keyword rate rises monotonically from a ~21% baseline to 40%
+(`DiffMeanPositional`), 36% (`MeanTokenDiffMean`), 28% (`LastTokenDiffMean`). Inspecting
+generations shows the expected over-steering arc: concept absent at low factors,
+naturally integrated mid-sweep, and by factor 5.0 the model often abandons the
+instruction entirely (e.g. refusing on a "gambling" concept) — which is exactly what the
+LM judge's harmonic mean is meant to punish. Concept coverage is uneven: a substantial
+share of concepts never visibly activate anywhere in the sweep.
+
+Two checks are still **outstanding**: (a) `DiffMean` producing bit-identical weights
+before/after these edits, and (b) `MeanTokenDiffMean` matching `DiffMean` within bf16
+noise (cosine > ~0.999). Check (b) is the empirical test of the RoPE assumption in §9 —
+if it fails, the left-padding premise is wrong, not just the code. Neither is settled by
+the run above, which never trained stock `DiffMean`.
 
 ### 4. Running the pipeline
 
@@ -251,6 +311,32 @@ uv run axbench/scripts/evaluate.py --config $CFG --dump_dir $DUMP --mode steerin
 
 `torchrun --nproc_per_node=$gpu_count` wraps `train.py`/`inference.py` only —
 `generate.py` and `evaluate.py` run as plain `uv run` scripts.
+
+**On Slurm, use the `run_preemptable_*.sh` wrappers instead of the raw commands
+above.** `run_preemptable.sh` holds `CFG`/`DUMP`/`NPROC`/`NUM_CHUNKS` and a
+commented-out line per stage; uncomment one stage at a time, since ordering *between*
+stages is still manual. Each stage script runs **both** of its modes from a single
+call:
+
+- `run_preemptable_generate.sh <CFG> <DUMP> <NUM_WORKERS> <MAX_CONCURRENT>` — training
+  then latent, **locally in the calling shell, no sbatch**, ordered by `set -e`. These
+  modes never touch the GPU (`generate.py` only moves a model to CUDA in
+  `--mode dpo_training`), so they need no allocation.
+- `run_preemptable_inference.sh <CFG> <DUMP> <NPROC> <NUM_CHUNKS>` — submits N latent
+  chunk jobs, then N steering chunk jobs carrying `--dependency=afterok` on *every*
+  latent job, so no steering chunk starts until the whole latent set has succeeded and
+  merged. Each steering worker also runs `--mode latent --verify_chunks` first.
+- `run_preemptable_evaluate_local.sh <CFG> <DUMP> <NUM_CHUNKS>` — same shape for the
+  local judge: N `steering` chunks, then N `steering_test` chunks chained behind them.
+  Here the chaining is *not* a data dependency (the two modes are independent); it
+  just serialises GPU demand.
+
+The chaining works by capturing ids from `sbatch --parsable` and passing them as
+`--dependency=afterok:<id:id:...>`. A preempted-and-requeued job never reaches
+`COMPLETED`, so dependents correctly keep waiting through preemption cycles; a genuine
+failure leaves them unsatisfiable, and this cluster's `kill_invalid_depend` cancels
+them rather than leaving them pending forever. A pending job showing `(BeginTime)` is
+just post-preemption backoff, not a problem.
 
 ### 5. Using pre-generated `concept500` data (skip data generation)
 
@@ -326,12 +412,16 @@ Each of these fails quietly — wrong results or ignored settings, no error:
   per-model setting must be added in **three** places — the `ModelParams` dataclass,
   `hierarchical_params`, and `_infer_type`'s type lists — or it is silently ignored
   and the model trains with a default.
-- **Steering needs latent mode to have run first.** `inference.py` calls
-  `pre_compute_mean_activations` before steering, which reads
-  `{ClassName}_max_act` from the latent parquet files. If that column doesn't exist,
-  `max_activations` is empty and `predict_steer` silently falls back to `1.0`,
-  quietly changing what every entry in the `steering_factors` sweep means. Any new
-  method therefore needs a working latent path, not just a steering one.
+- **Steering needs latent mode to have run first** — *no longer silent, but still a
+  trap.* `inference.py` calls `pre_compute_mean_activations` before steering, which
+  reads `{ClassName}_max_act` from `latent_data.parquet`. This used to fall back to a
+  factor scale of `1.0` without complaint; it now raises (missing file →
+  `FileNotFoundError` in `model.py`; missing concepts → `ValueError` in
+  `inference.py`). Any new method still needs a working latent path, not just a
+  steering one. What remains quiet is one layer up: the latent auto-merge catches
+  every exception and only warns, so latent chunks can all exit 0 with no merged
+  parquet, and the failure only surfaces once steering jobs have already been
+  scheduled onto GPUs.
 - **Per-rank checkpoint merging only covers `_weight.pt` / `_bias.pt`.** `train.py`
   saves per-rank files and merges them by concatenating along dim 0. Any extra
   checkpoint file a method writes will never be merged, and inference will fail to

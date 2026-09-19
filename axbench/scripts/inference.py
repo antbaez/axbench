@@ -2,7 +2,7 @@
 #
 # example launch command:
 #     torchrun --nproc_per_node=NUM_GPUS axbench/scripts/inference.py --config axbench/demo/sweep/inference.yaml --mode latent
-import os, argparse, yaml, json, glob, pickle, re, time, itertools, datetime
+import os, argparse, yaml, json, glob, pickle, re, time, itertools, datetime, uuid
 import shutil
 import pandas as pd
 from tqdm.auto import tqdm
@@ -13,7 +13,8 @@ import atexit
 
 from axbench.utils.dataset import (
     DatasetFactory,
-    SteeringDatasetFactory
+    SteeringDatasetFactory,
+    consolidate_steering_eval_cache
 )
 from axbench.utils.constants import * 
 from axbench.utils.model_utils import get_prefix_length, get_suffix_length
@@ -264,6 +265,14 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
         logger.warning(
             f"Chunk {chunk}/{args.num_chunks}: concepts [{chunk_lo}, {chunk_hi}) "
             f"-> {len(my_concept_ids)} to process")
+        # Chunk files and their resume state are deleted once merged, so a requeue
+        # after the merge would otherwise find no state and redo the whole window.
+        window_ids = [c for c in concept_ids if chunk_lo <= c < chunk_hi]
+        if _chunk_already_merged(args, "steering", window_ids):
+            logger.warning(
+                f"Chunk {chunk}: all {len(window_ids)} concepts already in the merged "
+                f"steering_data.parquet. Exiting.")
+            return
 
     if last_concept_id_processed is not None:
         if last_concept_id_processed in my_concept_ids:
@@ -422,6 +431,19 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             json.dump(base_prompts_debug, f, indent=2)
         logger.warning(f"Wrote base prompts for concepts {first_ten_concepts} to {debug_path}")
 
+    # Debug dump: prompt + every model's generation, for the first 10 input_ids x
+    # every steering factor, for the first 10 concepts -- written incrementally as
+    # each of those concepts finishes (not batched at the end), so a preempted run
+    # keeps whatever it already produced. Pre-loaded from disk so a resumed run
+    # (which skips concepts already done in an earlier attempt, see
+    # last_concept_id_processed above) doesn't lose entries a prior attempt wrote.
+    sample_generations_path = (
+        Path(overwrite_inference_dump_dir) / f"sample_generations_debug{chunk_tag(chunk)}_rank{rank}.json")
+    sample_generations_debug = {}
+    if first_ten_concepts and sample_generations_path.exists():
+        with open(sample_generations_path) as f:
+            sample_generations_debug = json.load(f)
+
     # Preload models that are shared across concepts, like HyperSteer.
     preloaded_models = dict()
     for model_name in training_args.models.keys():
@@ -496,11 +518,23 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             # Pre-compute mean activations once
             if model_name not in {"LoReFT", "BoW"} and model_name not in LATENT_EXCLUDE_MODELS:
                 benchmark_model.pre_compute_mean_activations(
-                    os.path.join(dump_dir, "inference"), 
+                    os.path.join(dump_dir, "inference"),
                     master_data_dir=args.master_data_dir,
                     disable_neuronpedia_max_act=args.disable_neuronpedia_max_act,
                     metadata=metadata,
                 )
+                # predict_steer looks up max_act per row and falls back to 1.0 on a miss,
+                # so a latent run covering only some chunks would silently rescale just
+                # part of the sweep. Same key column predict_steer resolves (model.py).
+                key_col = ("sae_id" if "sae" in model_name.lower()
+                           and not args.disable_neuronpedia_max_act else "concept_id")
+                uncovered = sorted(
+                    set(current_df[key_col]) - set(benchmark_model.max_activations))
+                if uncovered:
+                    raise ValueError(
+                        f"{model_name}: latent_data.parquet has no max_act for "
+                        f"{key_col}(s) {uncovered[:10]} ({len(uncovered)} total) -- these "
+                        f"would steer at factor x 1.0. Merge every latent chunk first.")
             unique_concept_ids = list(set(current_df["concept_id"].tolist()))
             logger.warning(f"Inference steering with {model_name} on {device} for concept {concept_id}.")
             # Run prediction
@@ -526,6 +560,32 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
                 benchmark_model = benchmark_model.to("cpu") # move shared model to cpu to save memory
                 
             torch.cuda.empty_cache()
+
+        if concept_id in first_ten_concepts:
+            model_names = [m for m in args.models if m not in STEERING_EXCLUDE_MODELS]
+            first_ten_input_ids = sorted(current_df["input_id"].unique())[:10]
+            rows = current_df[current_df["input_id"].isin(first_ten_input_ids)].sort_values(
+                ["input_id", "factor"])
+            sample_generations_debug[str(concept_id)] = {
+                "concept": rows["input_concept"].iloc[0],
+                "generations": [
+                    {
+                        "input_id": int(row["input_id"]),
+                        "factor": float(row["factor"]),
+                        "prompt": row["original_prompt"],
+                        "generations": {
+                            m: row[f"{m}_steered_generation"] for m in model_names
+                            if f"{m}_steered_generation" in current_df.columns
+                        },
+                    }
+                    for _, row in rows.iterrows()
+                ],
+            }
+            with open(sample_generations_path, "w") as f:
+                json.dump(sample_generations_debug, f, indent=2, ensure_ascii=False)
+            logger.warning(
+                f"Wrote sample generations for concept {concept_id} to {sample_generations_path}")
+
         save(overwrite_inference_dump_dir, 'steering', current_df, rank, chunk=chunk)
         logger.warning(
             f"Saved inference results for concept {concept_id} to "
@@ -577,6 +637,7 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             combined_df = combined_df.sort_values(by=['concept_id', 'input_id', 'factor']).reset_index(drop=True)
             combined_df.to_parquet(Path(dump_dir) / "inference" / "steering_data.parquet", engine='pyarrow')
             logger.warning(f"Saved combined steering inference results to {Path(dump_dir) / 'inference' / 'steering_data.parquet'}")
+            consolidate_steering_eval_cache(dump_dir, logger)
         else:
             logger.warning("No results to merge.")
 
@@ -615,6 +676,14 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
         logger.warning(
             f"Chunk {chunk}/{args.num_chunks}: concepts [{chunk_lo}, {chunk_hi}) "
             f"-> {len(my_concept_ids)} to process")
+        # Chunk files and their resume state are deleted once merged, so a requeue
+        # after the merge would otherwise find no state and redo the whole window.
+        window_ids = [c for c in concept_ids if chunk_lo <= c < chunk_hi]
+        if _chunk_already_merged(args, "latent", window_ids):
+            logger.warning(
+                f"Chunk {chunk}: all {len(window_ids)} concepts already in the merged "
+                f"latent_data.parquet. Exiting.")
+            return
 
     if last_concept_id_processed is not None:
         if last_concept_id_processed in my_concept_ids:
@@ -1154,27 +1223,38 @@ def _chunk_set_complete(args, mode):
     return expected.issubset(found)
 
 
+def _chunk_already_merged(args, mode, window_ids):
+    """True if the merged {mode}_data.parquet already covers every concept in window_ids."""
+    path = _inference_dir(args) / f"{mode}_data.parquet"
+    if not path.exists():
+        return False
+    merged = set(pd.read_parquet(path, columns=["concept_id"])["concept_id"].unique())
+    return set(window_ids).issubset(merged)
+
+
 def maybe_auto_merge_chunks(args, mode, logger):
     """
     Called by a --chunk job right after it finishes its own slice: if every
     concept is now covered across all rank_*_{mode}_chunk*_data.parquet files
     (i.e. this was the last chunk in the --num_chunks sweep to finish), merge
     them into {mode}_data.parquet immediately -- a separate --merge_chunks
-    invocation after the sweep is no longer required.
+    invocation after the sweep is no longer required. Once the merge passes
+    verification, the chunk files and their resume state are deleted.
 
-    If a sibling chunk job's own auto-merge races this one, the loser just
-    logs and moves on: merge_chunks doesn't delete its inputs, so a duplicate
-    merge only costs a wasted read+write, not correctness.
+    If a sibling chunk job's own auto-merge races this one, the loser either
+    fails reading a chunk file the winner already deleted, or merges a partial
+    set that fails verification -- either way it logs and leaves the winner's
+    merged file untouched.
     """
     try:
         if _chunk_set_complete(args, mode):
             logger.warning(f"All chunks present for {mode} -- auto-merging.")
-            merge_chunks(args, mode, logger)
+            merge_chunks(args, mode, logger, cleanup=True)
     except Exception as e:
         logger.warning(f"Auto-merge skipped ({e}); run --merge_chunks manually if needed.")
 
 
-def merge_chunks(args, mode, logger):
+def merge_chunks(args, mode, logger, cleanup=False):
     """
     Combine the per-chunk parquets written by N independent `--chunk` jobs into the
     single unchunked {mode}_data.parquet the downstream stages expect.
@@ -1183,8 +1263,10 @@ def merge_chunks(args, mode, logger):
     Model.pre_compute_mean_activations scans, so steering cannot read chunk files
     directly -- latent must be merged before any steering job starts.
 
-    Per-chunk inputs are left in place; they are named rank_*_{mode}_chunk*_data.parquet,
-    which that glob does not match, so they cannot confuse a later run.
+    The merge is written to a temporary file and checked (_check_merged) before it
+    replaces {mode}_data.parquet, so a failed or partial merge never overwrites a good
+    one. With cleanup=True, the merged chunk files and every chunk's resume state are
+    then deleted; otherwise they are left in place.
     """
     inference_dir = _inference_dir(args)
     paths = sorted(
@@ -1219,34 +1301,47 @@ def merge_chunks(args, mode, logger):
         combined = combined.sort_values(by=["concept_id"]).reset_index(drop=True)
 
     out = inference_dir / f"{mode}_data.parquet"
-    combined.to_parquet(out, engine="pyarrow")
-    logger.warning(
-        f"Wrote {out} -- {len(combined)} rows across {counts.shape[0]} concepts. "
-        f"Per-chunk files left in place; delete them once you are satisfied.")
+    if not _check_merged(args, mode, combined, f"merge of {len(paths)} chunk file(s)", logger):
+        raise ValueError(
+            f"Merged {mode} data failed verification -- {out} left untouched and chunk "
+            f"files left in place.")
+    # Unique temp name, so two racing mergers never write the same file.
+    tmp = inference_dir / f"{mode}_data.parquet.tmp.{uuid.uuid4().hex}"
+    try:
+        combined.to_parquet(tmp, engine="pyarrow")
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    logger.warning(f"Wrote {out} -- {len(combined)} rows across {counts.shape[0]} concepts.")
+
+    if cleanup:
+        stale = paths + glob.glob(str(inference_dir / f"{mode}_chunk*_{STATE_FILE}_rank_*"))
+        for p in stale:
+            Path(p).unlink(missing_ok=True)
+        logger.warning(f"Deleted {len(stale)} merged chunk/state file(s).")
+        if mode == "steering":
+            consolidate_steering_eval_cache(args.dump_dir, logger)
+    else:
+        logger.warning("Per-chunk files left in place; delete them once you are satisfied.")
 
 
-def verify_chunks(args, mode, logger):
+def _check_merged(args, mode, df, label, logger):
     """
-    Gate the next pipeline stage on a complete, usable merged parquet.
+    True if df is a complete, usable merged {mode} parquet.
 
     Checks concept coverage against the metadata, and for latent that every model has
     a populated {ModelName}_max_act -- the column steering multiplies its factors by.
     A missing or all-null column there is the silent failure where every steering
     factor quietly falls back to 1.0.
     """
-    inference_dir = _inference_dir(args)
-    path = inference_dir / f"{mode}_data.parquet"
-    if not path.exists():
-        raise FileNotFoundError(f"{path} does not exist -- run --merge_chunks first.")
-    df = pd.read_parquet(path)
-
     expected = sorted(m["concept_id"] for m in load_metadata_flatten(args.data_dir))
     found = sorted(df["concept_id"].unique())
     missing = sorted(set(expected) - set(found))
     extra = sorted(set(found) - set(expected))
 
     ok = True
-    logger.warning(f"{path.name}: {len(df)} rows, {len(found)}/{len(expected)} concepts")
+    logger.warning(f"{label}: {len(df)} rows, {len(found)}/{len(expected)} concepts")
     if missing:
         ok = False
         logger.warning(f"  MISSING {len(missing)} concept_id(s), first 10: {missing[:10]}")
@@ -1271,7 +1366,15 @@ def verify_chunks(args, mode, logger):
                 f"null={n_null} non-positive={n_nonpos}"
                 + (f"  <- these {n_nonpos} fall back to 50" if n_nonpos else ""))
 
-    if not ok:
+    return ok
+
+
+def verify_chunks(args, mode, logger):
+    """Gate the next pipeline stage on a complete, usable merged parquet."""
+    path = _inference_dir(args) / f"{mode}_data.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist -- run --merge_chunks first.")
+    if not _check_merged(args, mode, pd.read_parquet(path), path.name, logger):
         raise SystemExit(f"verify_chunks FAILED for {path} -- do not start the next stage.")
     logger.warning(f"verify_chunks PASSED for {path}")
 
@@ -1310,7 +1413,9 @@ def main():
             'args': ['--merge_chunks'],
             'kwargs': {
                 'action': 'store_true',
-                'help': 'Merge per-chunk parquets for --mode into {mode}_data.parquet, then exit.'
+                'help': 'Merge per-chunk parquets for --mode into {mode}_data.parquet, then exit. '
+                        'The merge is verified before it is written; with --verify_chunks '
+                        'also passed, the merged chunk files are then deleted.'
             }
         },
         {
@@ -1348,7 +1453,10 @@ def main():
     # and without holding a GPU.
     if inference_args.merge_chunks or inference_args.verify_chunks:
         if inference_args.merge_chunks:
-            merge_chunks(inference_args, inference_args.mode, logger)
+            # Deleting the chunk files is opt-in here: only when --verify_chunks is
+            # passed too. The merge itself is always verified before it is written.
+            merge_chunks(inference_args, inference_args.mode, logger,
+                         cleanup=inference_args.verify_chunks)
         if inference_args.verify_chunks:
             verify_chunks(inference_args, inference_args.mode, logger)
         elapsed = time.time() - start_time

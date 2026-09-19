@@ -6,6 +6,8 @@ generate:
   num_base_instructions: 72
   concept_path: "axbench/data/gemma-2-9b-it_20-gemmascope-res-131k.json"
   max_concepts: 500
+  # text concepts from concept500 go first; the rest are random text concepts from concept_path
+  seed_concepts_dir: "axbench/concept500/prod_9b_l20_v1/generate"
   master_data_dir: "axbench/data"
   dataset_category: "instruction"
   lm_use_cache: false
@@ -34,7 +36,7 @@ train:
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
-      num_positions: 32
+      num_positions: 64
 inference:
   use_bf16: true
   models: ["MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositional"]
@@ -51,7 +53,9 @@ inference:
   steering_output_length: 128
   steering_layers: [20]
   steering_num_of_examples: 10 # number of examples per concept and per factor
-  steering_factors: [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0, 4.0, 5.0] # number of steering factors per example
+  # steering_factors: [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] # number of steering factors per example
+  steering_factors: [0.25, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
   # master data dir is shared across all jobs.
   master_data_dir: "axbench/data"
   seed: 42

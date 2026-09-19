@@ -304,11 +304,15 @@ async def instruction_with_concept(client, tokenizer, concepts, content, length=
 
 
 async def get_contrastive_concepts(client, concepts, api_tag=""):
-    """One call per concept: ask for 10 related-but-distinct concepts to swap in later.
+    """One call per concept: ask for 10 unrelated, format-matched concepts to swap in later.
+
+    Unrelated rather than near-neighbor: a contrast concept from the target's own domain
+    leaves rewritten text still sitting on the target, so a steered generation cannot be
+    told apart from an unsteered one. Format-matched so swapping one in is a minimal edit.
 
     Generating the list once and letting callers sample from it (rather than letting the
-    rewrite prompt invent a contrast concept fresh each time) avoids always converging on
-    the same nearest-neighbor concept for a given target concept.
+    rewrite prompt invent a contrast concept fresh each time) keeps the draw varied
+    instead of converging on whatever the rewrite prompt reaches for first.
     """
     prompts = [T_GENERATE_CONTRASTIVE_CONCEPTS.format(CONCEPT=concept) for concept in concepts]
     responses = await client.chat_completions(f"{api_tag}.get_contrastive_concepts", prompts)

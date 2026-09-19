@@ -29,6 +29,10 @@ class DatasetArgs:
     rotation_freq: Optional[int] = 1_000
     seed: Optional[int] = None
     max_concepts: Optional[int] = None
+    # generate.py --mode training: a prior run's generate/ dir (e.g. concept500) whose
+    # text-genre concepts are taken first, before random text concepts fill up to
+    # max_concepts. None = random selection only.
+    seed_concepts_dir: Optional[str] = None
     model_name: Optional[str] = None
     steering_model_name: Optional[str] = None
     n_steering_factors: Optional[int] = None

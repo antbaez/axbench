@@ -401,22 +401,23 @@ class Model(BaseModel):
     
     def pre_compute_mean_activations(self, dump_dir, **kwargs):
         max_activations = {} # sae_id to max_activation
-        # Loop over saved latent files in dump_dir. Exact filename, not a
-        # "latent_"-prefix glob: generate.py --mode latent can write
-        # latent_eval_data.parquet into this same directory (when
-        # --overwrite_inference_data_dir points at it), which has no
-        # {model}_max_act column and would otherwise match the prefix too.
-        for file in os.listdir(dump_dir):
-            if file == "latent_data.parquet":
-                latent_path = os.path.join(dump_dir, file)
-                latent = pd.read_parquet(latent_path)
-                # loop through unique sorted concept_id
-                for concept_id in sorted(latent["concept_id"].unique()):
-                    concept_latent = latent[latent["concept_id"] == concept_id]
-                    max_act = concept_latent[f"{self.__str__()}_max_act"].max()
-                    max_activations[concept_id] = max_act if max_act > 0 else 50
+        # Exact filename, not a "latent_"-prefix glob: older dumps keep
+        # generate.py's latent_eval_data.parquet in this same directory, which has
+        # no {model}_max_act column and would otherwise match the prefix too.
+        latent_path = os.path.join(dump_dir, "latent_data.parquet")
+        if not os.path.exists(latent_path):
+            raise FileNotFoundError(
+                f"{latent_path} not found -- steering scales every factor by this file's "
+                f"per-concept max_act, so without it each factor silently falls back to "
+                f"1.0. Run inference.py --mode latent (then --merge_chunks) first.")
+        latent = pd.read_parquet(latent_path)
+        # loop through unique sorted concept_id
+        for concept_id in sorted(latent["concept_id"].unique()):
+            concept_latent = latent[latent["concept_id"] == concept_id]
+            max_act = concept_latent[f"{self.__str__()}_max_act"].max()
+            max_activations[concept_id] = max_act if max_act > 0 else 50
         self.max_activations = max_activations
-        return max_activations  
+        return max_activations
 
     def to(self, device):
         """Move model to specified device"""

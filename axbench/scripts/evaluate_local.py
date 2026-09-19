@@ -11,7 +11,7 @@ import itertools
 from axbench.models.local_judge import LocalLanguageModel
 from axbench.evaluators.lm_judge_local import LMJudgeEvaluator as LocalLMJudgeEvaluator
 import ast
-import os, argparse, yaml, json, glob, pickle, tempfile, copy
+import os, argparse, yaml, json, glob, pickle, tempfile, copy, uuid
 import pandas as pd
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -418,12 +418,18 @@ def eval_steering(args):
     # Window is derived from the id space of the same parquet data_generator reads, so
     # --num_chunks alone determines the split and the chunks always tile it exactly.
     if args.chunk is not None:
-        n_concepts = int(pd.read_parquet(
-            os.path.join(data_dir, "steering_data.parquet"),
-            columns=["concept_id"])["concept_id"].max()) + 1
+        n_concepts = _n_concepts(args)
         chunk_lo, chunk_hi = chunk_bounds(args.chunk, args.num_chunks, n_concepts)
         logger.warning(
             f"Chunk {args.chunk}/{args.num_chunks}: concepts [{chunk_lo}, {chunk_hi})")
+        # Chunk files and their resume state are deleted once merged, so a requeue
+        # after the merge would otherwise find no state and re-judge the whole window
+        # -- checked before the judge model is loaded.
+        if _chunk_already_merged(args, range(chunk_lo, chunk_hi)):
+            logger.warning(
+                f"Chunk {args.chunk}: all concepts in [{chunk_lo}, {chunk_hi}) already in "
+                f"the merged {args.mode}.jsonl. Exiting.")
+            return
     else:
         chunk_lo, chunk_hi = 0, float("inf")
 
@@ -672,6 +678,22 @@ def eval_steering(args):
     logger.warning("Evaluation completed!")
 
 
+def _n_concepts(args):
+    """Size of the concept-id space, from the inference steering data being judged."""
+    return int(pd.read_parquet(
+        os.path.join(args.data_dir, "steering_data.parquet"),
+        columns=["concept_id"])["concept_id"].max()) + 1
+
+
+def _chunk_already_merged(args, window_ids):
+    """True if the merged {mode}.jsonl already covers every concept in window_ids."""
+    path = Path(args.dump_dir) / f"{args.mode}.jsonl"
+    if not path.exists():
+        return False
+    merged = {entry["concept_id"] for entry in load_jsonl(path)}
+    return set(window_ids).issubset(merged)
+
+
 def _chunk_set_complete(args):
     """
     True once every concept in [0, n_concepts) has an entry in some
@@ -682,9 +704,7 @@ def _chunk_set_complete(args):
     jsonl_paths = glob.glob(str(dump_dir / f"{args.mode}_chunk*.jsonl"))
     if not jsonl_paths:
         return False
-    n_concepts = int(pd.read_parquet(
-        os.path.join(args.data_dir, "steering_data.parquet"),
-        columns=["concept_id"])["concept_id"].max()) + 1
+    n_concepts = _n_concepts(args)
     found = set()
     for p in jsonl_paths:
         found.update(entry["concept_id"] for entry in load_jsonl(p))
@@ -697,29 +717,36 @@ def maybe_auto_merge_chunks(args):
     concept in [0, n_concepts) is now covered across all {mode}_chunk*.jsonl
     files (i.e. this was the last chunk in the --num_chunks sweep to finish),
     merge them immediately -- a separate --merge_chunks invocation is no
-    longer required. Runs non-interactively: skips merge_chunks' stale-file
-    deletion prompt, which would otherwise hit closed stdin under sbatch.
+    longer required. Once the merge passes verification, the chunk files are
+    deleted (see merge_chunks).
 
-    If a sibling chunk job's own auto-merge races this one, the loser just
-    logs and moves on: merge_chunks doesn't delete its inputs when
-    non-interactive, so a duplicate merge only costs a wasted read+write, not
-    correctness.
+    If a sibling chunk job's own auto-merge races this one, the loser either
+    fails reading a chunk file the winner already deleted, or merges a partial
+    set that fails verification -- either way it logs and leaves the winner's
+    merged files untouched.
     """
     try:
         if _chunk_set_complete(args):
             logger.warning(f"All chunks present for {args.mode} -- auto-merging.")
-            merge_chunks(args, interactive=False)
+            merge_chunks(args)
     except Exception as e:
         logger.warning(f"Auto-merge skipped ({e}); run --merge_chunks manually if needed.")
 
 
-def merge_chunks(args, interactive=True):
+def merge_chunks(args):
     """
     Combine per-chunk result files written by N separate `--chunk`-scoped
     `eval_steering` runs into the same canonical {mode}.jsonl /
     {mode}_data.parquet / {mode}_evaluate_state.pkl files a single unchunked
     run would have produced. Chunks are discovered by globbing rather than
     trusting --num_chunks, so this merges whatever chunk files exist.
+
+    The merge is verified first -- every concept in [0, n_concepts) present in the
+    jsonl, and the parquet covering the same concepts -- and refused otherwise,
+    leaving any existing merged files and all chunk files untouched. Merged files
+    are written to temporary names and then moved into place, so a failed or
+    partial merge never overwrites a good one. After a verified merge, every
+    per-chunk file it superseded is deleted.
     """
     dump_dir = Path(args.dump_dir)
     prefix = f"{args.mode}_chunk"
@@ -746,29 +773,48 @@ def merge_chunks(args, interactive=True):
     if len(concept_ids) != len(set(concept_ids)):
         raise ValueError(
             "Duplicate concept_id found across chunk .jsonl files -- refusing to merge.")
-    missing = sorted(set(range(min(concept_ids), max(concept_ids) + 1)) - set(concept_ids))
+    missing = sorted(set(range(_n_concepts(args))) - set(concept_ids))
     if missing:
-        logger.warning(
-            f"Merging with {len(missing)} missing concept_id(s) in range "
-            f"[{min(concept_ids)}, {max(concept_ids)}]: {missing}. "
-            "Some chunks may not have finished yet -- the merged result is incomplete.")
-
-    merged_entries.sort(key=lambda entry: entry["concept_id"])
-    merged_jsonl_path = dump_dir / f"{args.mode}.jsonl"
-    with open(merged_jsonl_path, "w") as f:
-        for entry in merged_entries:
-            f.write(json.dumps(entry) + "\n")
+        raise ValueError(
+            f"{len(missing)} concept_id(s) missing from the chunk .jsonl files, first 10: "
+            f"{missing[:10]}. Some chunks may not have finished yet -- refusing to merge; "
+            f"chunk files left in place.")
 
     parquet_paths = sorted(glob.glob(str(dump_dir / f"{prefix}*_data.parquet")), key=chunk_index)
+    merged_df = None
     if parquet_paths:
         merged_df = pd.concat(
             [pd.read_parquet(p) for p in tqdm(parquet_paths, desc="Merging chunk parquet files")],
             ignore_index=True)
         merged_df = merged_df.sort_values(["concept_id", "input_id"]).reset_index(drop=True)
-        merged_df.to_parquet(dump_dir / f"{args.mode}_data.parquet", index=False)
+        parquet_ids = set(merged_df["concept_id"].unique())
+        if parquet_ids != set(concept_ids):
+            raise ValueError(
+                f"Chunk parquets cover {len(parquet_ids)} concepts but the chunk .jsonl files "
+                f"cover {len(set(concept_ids))} -- refusing to merge; chunk files left in place.")
     else:
         logger.warning(
             f"No chunk parquet files found matching {prefix}*_data.parquet -- skipping parquet merge.")
+
+    # Verified -- write under unique temp names, then move into place.
+    merged_entries.sort(key=lambda entry: entry["concept_id"])
+    merged_jsonl_path = dump_dir / f"{args.mode}.jsonl"
+    merged_parquet_path = dump_dir / f"{args.mode}_data.parquet"
+    tag = uuid.uuid4().hex
+    tmp_jsonl = dump_dir / f"{args.mode}.jsonl.tmp.{tag}"
+    tmp_parquet = dump_dir / f"{args.mode}_data.parquet.tmp.{tag}"
+    try:
+        with open(tmp_jsonl, "w") as f:
+            for entry in merged_entries:
+                f.write(json.dumps(entry) + "\n")
+        if merged_df is not None:
+            merged_df.to_parquet(tmp_parquet, index=False)
+            os.replace(tmp_parquet, merged_parquet_path)
+        os.replace(tmp_jsonl, merged_jsonl_path)
+    finally:
+        for tmp in (tmp_jsonl, tmp_parquet):
+            if tmp.exists():
+                tmp.unlink()
 
     state_path = dump_dir / f"{args.mode}_{STATE_FILE}"
     with open(state_path, "wb") as f:
@@ -776,29 +822,14 @@ def merge_chunks(args, interactive=True):
     logger.warning(f"Merged {len(merged_entries)} concept result(s) into {merged_jsonl_path}")
 
     # Everything that fed the merge above is now redundant with the merged
-    # {mode}.jsonl / {mode}_data.parquet / {mode}_evaluate_state.pkl -- offer
-    # to clean it up rather than leaving it to accumulate across runs.
+    # {mode}.jsonl / {mode}_data.parquet / {mode}_evaluate_state.pkl.
     stale_paths = jsonl_paths + parquet_paths
-    stale_paths += sorted(
-        glob.glob(str(dump_dir / f"{prefix}*_evaluate_state.pkl")), key=chunk_index)
-    stale_paths += sorted(glob.glob(str(dump_dir / "temp_all_results_chunk*.pkl")))
-    stale_paths += sorted(glob.glob(str(dump_dir / "temp_eval_dfs_chunk*.pkl")))
-    if stale_paths:
-        if interactive:
-            print("\nThe following per-chunk files are now superseded by the merged output:")
-            for p in stale_paths:
-                print(f"  {p}")
-            answer = input(f"Delete these {len(stale_paths)} file(s)? [y/N]: ").strip().lower()
-            if answer in ("y", "yes"):
-                for p in stale_paths:
-                    os.remove(p)
-                logger.warning(f"Deleted {len(stale_paths)} stale chunk file(s).")
-            else:
-                logger.warning("Leaving stale chunk files in place.")
-        else:
-            logger.warning(
-                f"Leaving {len(stale_paths)} stale chunk file(s) in place (auto-merge); "
-                "delete manually or via --merge_chunks if desired.")
+    stale_paths += glob.glob(str(dump_dir / f"{prefix}*_{STATE_FILE}"))
+    stale_paths += glob.glob(str(dump_dir / "temp_all_results_chunk*.pkl"))
+    stale_paths += glob.glob(str(dump_dir / "temp_eval_dfs_chunk*.pkl"))
+    for p in stale_paths:
+        Path(p).unlink(missing_ok=True)
+    logger.warning(f"Deleted {len(stale_paths)} merged chunk file(s).")
 
     if args.mode == "train_data":
         return

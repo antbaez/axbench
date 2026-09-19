@@ -160,11 +160,6 @@ class LanguageModel(object):
             raise ValueError(f"{model} model class is not supported yet.")
         self.stats = LanguageModelStats(model)
         self.client = client
-        # dump dir
-        if dump_dir:
-            cur_save_dir = Path(dump_dir) / "lm_cache"
-            cur_save_dir.mkdir(parents=True, exist_ok=True)
-            self.dump_dir = cur_save_dir
         self.temperature = kwargs.get("temperature", 1.0)
         self.cache_dir = None
         self.use_cache = use_cache
@@ -269,13 +264,6 @@ class LanguageModel(object):
                     prompt=batch_prompts[j], completion=completion)
 
         return all_completions
-
-    def dump(self):
-        with open(self.dump_dir / "tmp_prompt_cache.json", "w") as outfile:
-            json.dump(self.stats.prompt_cache, outfile, indent=4)
-        
-        with open(self.dump_dir / "cost.jsonl", 'a') as f:
-            f.write(json.dumps({"price": self.stats.get_total_price()}) + '\n')
 
     def save_cache(self):
         if self.use_cache:

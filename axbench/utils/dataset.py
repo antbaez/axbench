@@ -191,6 +191,68 @@ BASE_INSTRUCTIONS_FILE = "base_instructions.json"
 CONTRASTIVE_CONCEPTS_FILE = "contrastive_concepts.json"
 
 
+# Steering eval prompts (ContrastInstructions). Each concept's prompts are cached in
+# their own file while steering runs, so concurrent chunk jobs never write the same
+# file; the steering merge folds them into STEERING_EVAL_FILE and deletes them.
+STEERING_EVAL_FILE = "steering_eval_data.parquet"
+STEERING_EVAL_CACHE_DIR = "steering_eval_cache"
+
+
+def _steering_eval_paths(dump_dir):
+    inference_dir = Path(dump_dir) / "inference"
+    return inference_dir / STEERING_EVAL_FILE, inference_dir / STEERING_EVAL_CACHE_DIR
+
+
+def consolidate_steering_eval_cache(dump_dir, logger=logger):
+    """
+    Fold the per-concept steering prompt cache files into steering_eval_data.parquet
+    (per-concept files win over rows already there), then delete them. A lock file
+    keeps two racing mergers from both rewriting the file; the loser just skips, and
+    any files it leaves behind are still read as cache and folded in next time.
+    """
+    merged_path, cache_dir = _steering_eval_paths(dump_dir)
+    paths = sorted(cache_dir.glob("concept_*.parquet"))
+    if not paths:
+        return
+    lock_path = cache_dir / ".consolidate.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL)
+    except FileExistsError:
+        logger.warning(
+            f"{lock_path} exists -- another merge is consolidating the steering prompt "
+            f"cache (or one crashed mid-way; delete the lock if so). Skipping.")
+        return
+    try:
+        new_dfs = []
+        for p in paths:
+            try:
+                new_dfs.append(pd.read_parquet(p))
+            except FileNotFoundError:
+                pass
+        if not new_dfs:
+            return
+        combined = pd.concat(new_dfs, ignore_index=True)
+        if merged_path.exists():
+            previous = pd.read_parquet(merged_path)
+            previous = previous[~previous["concept_id"].isin(combined["concept_id"].unique())]
+            combined = pd.concat([previous, combined], ignore_index=True)
+        combined = combined.sort_values(["concept_id", "input_id"]).reset_index(drop=True)
+        tmp_path = merged_path.with_name(f"{merged_path.name}.tmp.{os.getpid()}")
+        combined.to_parquet(tmp_path, index=False)
+        os.replace(tmp_path, merged_path)
+        for p in paths:
+            p.unlink(missing_ok=True)
+        logger.warning(
+            f"Consolidated {len(paths)} steering prompt cache file(s) into {merged_path}.")
+    finally:
+        os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)
+    try:
+        cache_dir.rmdir()
+    except OSError:
+        pass
+
+
 def _write_json_atomically(obj, path):
     """Write via a temp file + rename so a preemption can't leave a truncated store."""
     tmp_path = f"{path}.tmp"
@@ -242,7 +304,7 @@ def load_contrastive_concepts(data_dir):
 
 
 def load_or_create_contrastive_concepts_batch(lm_model, concepts, data_dir, api_tag=""):
-    """Each concept's 10 related-but-distinct concepts, generated once and reused.
+    """Each concept's 10 unrelated, format-matched contrast concepts, generated once and reused.
 
     Missing concepts are generated in one batched pass, before any per-concept work,
     so concurrent generation never has to write the store. Persisted so a preempted
@@ -302,10 +364,23 @@ class DatasetFactory(object):
         self.seed_instructions = load_from_disk(os.path.join(master_data_dir, "seed_instructions"))
         self.dataset_category = dataset_category
         self.overwrite_inference_data_dir = kwargs.get("overwrite_inference_data_dir", None)
-        if self.overwrite_inference_data_dir is not None and os.path.exists(self.overwrite_inference_data_dir):
-            # load pre-generated data
-            self.pregenerated_inference_df = pd.read_parquet(os.path.join(self.overwrite_inference_data_dir, "latent_eval_data.parquet"))
-            self.logger.warning(f"Loaded pre-generated data from {self.overwrite_inference_data_dir}.")
+        self.pregenerated_inference_df = None
+        if self.overwrite_inference_data_dir is not None:
+            # generate.py --mode latent now writes latent_eval_data.parquet into
+            # generate/; older dumps (and the released concept500 data) keep it in a
+            # sibling inference/, so fall back to that. Checked once, by file rather
+            # than by directory: inference.py creates inference/ itself, so "the
+            # directory exists" said nothing about whether the eval data was there.
+            given_dir = Path(self.overwrite_inference_data_dir)
+            candidates = [given_dir / "latent_eval_data.parquet",
+                          given_dir.parent / "inference" / "latent_eval_data.parquet"]
+            latent_eval_path = next((c for c in candidates if c.exists()), None)
+            if latent_eval_path is None:
+                raise FileNotFoundError(
+                    f"latent_eval_data.parquet not found in any of {[str(c) for c in candidates]} "
+                    f"-- run generate.py --mode latent first.")
+            self.pregenerated_inference_df = pd.read_parquet(latent_eval_path)
+            self.logger.warning(f"Loaded pre-generated data from {latent_eval_path}.")
 
         # create a shared genre-based negative pools all at once
         #
@@ -352,9 +427,6 @@ class DatasetFactory(object):
 
     def reset_stats(self):
         """Reset API costs"""
-        # dump() writes cost.jsonl and the prompt log; that is unrelated to whether
-        # completions are cached, so it runs either way.
-        self.lm_model.dump()
         self.lm_model.stats.print_report()
         self.lm_model.stats.reset()
 
@@ -381,7 +453,7 @@ class DatasetFactory(object):
         return concept_genres_map
 
     def prepare_concepts(self, concepts, **kwargs):
-        if self.overwrite_inference_data_dir is not None and os.path.exists(self.overwrite_inference_data_dir):
+        if self.pregenerated_inference_df is not None:
             self.logger.info("Using pre-generated metadata.")
             return {}, {}
 
@@ -438,7 +510,7 @@ class DatasetFactory(object):
         train_contrast_concepts_map, eval_contrast_concepts_map, mode="balance", **kwargs):
         """category: positive, negative, hard negative"""
         
-        if self.overwrite_inference_data_dir is not None and os.path.exists(self.overwrite_inference_data_dir):
+        if self.pregenerated_inference_df is not None:
             if mode == "balance":
                 self.logger.info("Using pre-generated data.")
                 concept_df = self.pregenerated_inference_df[self.pregenerated_inference_df["concept_id"] == kwargs.get("concept_id")].copy()
@@ -875,24 +947,35 @@ class SteeringDatasetFactory(object):
 
             elif dataset_name == "ContrastInstructions":
                 # Steering prompts drawn from the same distribution training was fit on:
-                # base instructions from the shared pool, rewritten to carry one of this
-                # concept's stored contrast concepts. They must NOT name the target
-                # concept -- otherwise the model would discuss it unprompted and the
-                # judge would score the prompt rather than the intervention.
+                # base instructions from the shared pool, rewritten to carry a contrast
+                # concept held out from this concept's own 10. They must NOT name the
+                # target concept -- otherwise the model would discuss it unprompted and
+                # the judge would score the prompt rather than the intervention.
+                #
+                # Held out from this concept's own 10 because those are what its training
+                # negatives were built from: the direction was fit to not respond to them,
+                # so evaluating on them tests material the vector was already tuned against.
                 #
                 # Generated once and persisted, so reruns reuse the same eval prompts
-                # (the rewrites are temperature-1.0 and uncached). Delete
-                # steering_eval_data.parquet to get a fresh set.
+                # (the rewrites are temperature-1.0 and uncached). Each concept goes to
+                # its own cache file -- concurrent chunk jobs used to read-modify-write
+                # one shared parquet and corrupted it -- which the steering merge folds
+                # into steering_eval_data.parquet. Delete both to get a fresh set.
                 assert dump_dir is not None, "dump_dir is required for ContrastInstructions."
                 data_dir = os.path.join(dump_dir, "generate")
-                cache_path = os.path.join(dump_dir, "inference", "steering_eval_data.parquet")
+                merged_path, cache_dir = _steering_eval_paths(dump_dir)
+                concept_cache_path = cache_dir / f"concept_{concept_id}.parquet"
 
                 cached_df = None
-                if os.path.exists(cache_path):
-                    stored = pd.read_parquet(cache_path)
+                for path in (concept_cache_path, merged_path):
+                    try:
+                        stored = pd.read_parquet(path)
+                    except FileNotFoundError:
+                        continue
                     hit = stored[stored["concept_id"] == concept_id]
                     if len(hit) >= subset_n:
                         cached_df = hit.head(subset_n)
+                        break
 
                 if cached_df is not None:
                     prompt_rows = cached_df
@@ -907,8 +990,20 @@ class SteeringDatasetFactory(object):
 
                     sampled = random.sample(
                         base_instructions, min(subset_n, len(base_instructions)))
-                    contrast_concepts = assign_contrast_concepts(
-                        contrastive_store[concept], len(sampled))
+                    # Excluded by value, not just by key: with concepts generated
+                    # independently per source concept, the same generic concept can
+                    # surface under several of them, including this one's own 10.
+                    own = set(contrastive_store[concept])
+                    held_out = sorted({
+                        c for other, items in contrastive_store.items() if other != concept
+                        for c in items if c not in own
+                    })
+                    if not held_out:
+                        raise ValueError(
+                            f"no held-out contrast concepts for '{concept}' -- "
+                            f"{CONTRASTIVE_CONCEPTS_FILE} in {data_dir} needs entries for "
+                            f"more than one concept.")
+                    contrast_concepts = assign_contrast_concepts(held_out, len(sampled))
                     # inject the concept first, then swap it out: the negative is a
                     # minimal edit of its own positive, not of the bare instruction.
                     positives = asyncio.run(run_tasks([instruction_with_concept(
@@ -926,13 +1021,10 @@ class SteeringDatasetFactory(object):
                         "input": negatives,
                         "contrast_concept": contrast_concepts[:len(negatives)],
                     })
-                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                    combined = prompt_rows
-                    if os.path.exists(cache_path):
-                        previous = pd.read_parquet(cache_path)
-                        previous = previous[previous["concept_id"] != concept_id]
-                        combined = pd.concat([previous, prompt_rows], ignore_index=True)
-                    combined.to_parquet(cache_path, index=False)
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    tmp_path = cache_dir / f"concept_{concept_id}.parquet.tmp.{os.getpid()}"
+                    prompt_rows.to_parquet(tmp_path, index=False)
+                    os.replace(tmp_path, concept_cache_path)
 
                 all_examples = []
                 for i, row in enumerate(prompt_rows.itertuples()):

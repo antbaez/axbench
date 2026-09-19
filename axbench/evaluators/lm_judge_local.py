@@ -28,6 +28,10 @@ logging.basicConfig(format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)
     level=logging.WARN)
 logger = logging.getLogger(__name__)
 
+# Set once the first task in this process has dumped its judge samples. Each chunk
+# runs in its own process, so every chunk logs its own first concept.
+_JUDGE_SAMPLES_LOGGED = False
+
 
 class LMJudgeEvaluator(Evaluator):
     DEFAULT_RATING = 0.0
@@ -78,6 +82,30 @@ class LMJudgeEvaluator(Evaluator):
         completions = asyncio.run(process_batch())
         return self._get_ratings_from_completions(completions, min_rating, max_rating), completions
 
+    def _maybe_log_judge_samples(self, column_name, groups, n_samples=3):
+        """
+        Dump the first n_samples (prompt, raw completion, parsed rating) triples of each
+        judge type, once per process, so a run can be spot-checked end to end -- most
+        importantly that `Rating:` parses, since a format mismatch silently becomes
+        DEFAULT_RATING rather than raising. The rendered prompt already embeds the
+        instruction and the steered generation, so it doubles as the input record.
+        """
+        global _JUDGE_SAMPLES_LOGGED
+        if _JUDGE_SAMPLES_LOGGED:
+            return
+        _JUDGE_SAMPLES_LOGGED = True
+        for judge_type, prompts, completions, ratings in groups:
+            for i in range(min(n_samples, len(prompts))):
+                print(
+                    f"\n{'#' * 78}\n"
+                    f"[judge-sample] concept_id={self.concept_id} model={column_name} "
+                    f"type={judge_type} example={i}\n"
+                    f"{'#' * 78}\n"
+                    f"--- PROMPT ---\n{prompts[i]}\n"
+                    f"--- COMPLETION ---\n{completions[i]}\n"
+                    f"--- PARSED RATING --- {ratings[i]}\n",
+                    flush=True)
+
     def _get_all_ratings_from_data(self, data, column_name):
         model_relevance_concept_prompts = []
         model_relevance_instruction_prompts = []
@@ -117,6 +145,15 @@ class LMJudgeEvaluator(Evaluator):
         model_relevance_concept_completions = merged_completions[:n]
         model_relevance_instruction_completions = merged_completions[n:2 * n]
         model_fluency_completions = merged_completions[2 * n:]
+
+        self._maybe_log_judge_samples(
+            column_name,
+            [("concept_relevance", model_relevance_concept_prompts,
+              model_relevance_concept_completions, model_relevance_concept_ratings),
+             ("instruction_relevance", model_relevance_instruction_prompts,
+              model_relevance_instruction_completions, model_relevance_instruction_ratings),
+             ("fluency", model_fluency_prompts,
+              model_fluency_completions, model_fluency_ratings)])
 
         return list(zip(model_relevance_concept_prompts, model_relevance_concept_ratings)), \
                list(zip(model_relevance_instruction_prompts, model_relevance_instruction_ratings)), \
