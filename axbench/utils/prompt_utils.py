@@ -303,8 +303,18 @@ async def instruction_with_concept(client, tokenizer, concepts, content, length=
     return instruction_content
 
 
+def _parse_concept_list(response):
+    return [line.strip(" -*\t") for line in response.split("\n") if line.strip()]
+
+
 async def get_contrastive_concepts(client, concepts, api_tag=""):
-    """One call per concept: ask for 10 unrelated, format-matched concepts to swap in later.
+    """Two calls per concept: 36 unrelated, format-matched concepts to swap in later, then
+    36 more with the first 36 shown so the second batch doesn't repeat them.
+
+    Two calls of 36 rather than one call for 72: a single long list came back anywhere
+    from 1 to 123 items (one concept as a single comma-separated line), while 36 per call
+    stays close to the requested count. The merged list is de-duplicated (ignoring case
+    and surrounding quotes), so it can come out slightly under 72.
 
     Unrelated rather than near-neighbor: a contrast concept from the target's own domain
     leaves rewritten text still sitting on the target, so a steered generation cannot be
@@ -316,10 +326,22 @@ async def get_contrastive_concepts(client, concepts, api_tag=""):
     """
     prompts = [T_GENERATE_CONTRASTIVE_CONCEPTS.format(CONCEPT=concept) for concept in concepts]
     responses = await client.chat_completions(f"{api_tag}.get_contrastive_concepts", prompts)
+    first = [_parse_concept_list(response) for response in responses]
+
+    prompts = [T_GENERATE_MORE_CONTRASTIVE_CONCEPTS.format(
+        CONCEPT=concept, EXISTING_CONCEPTS="\n".join(existing))
+        for concept, existing in zip(concepts, first)]
+    responses = await client.chat_completions(f"{api_tag}.get_more_contrastive_concepts", prompts)
+
     contrastive_concepts = {}
-    for concept, response in zip(concepts, responses):
-        lines = [line.strip(" -*\t") for line in response.split("\n") if line.strip()]
-        contrastive_concepts[concept] = lines
+    for concept, existing, response in zip(concepts, first, responses):
+        merged, seen = [], set()
+        for item in existing + _parse_concept_list(response):
+            key = item.strip("'\" ").lower()
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(item)
+        contrastive_concepts[concept] = merged
     return contrastive_concepts
 
 

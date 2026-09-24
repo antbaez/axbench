@@ -490,6 +490,7 @@ class MeanTokenDiffMean(MeanActivation):
         prefix_length = kwargs["prefix_length"]
 
         positive_activations, negative_activations = [], []
+        _printed = False
         for _ in range(self.training_args.n_epochs):
             for batch in train_dataloader:
                 inputs = {k: v.to(self.device) for k, v in batch.items()}
@@ -503,11 +504,23 @@ class MeanTokenDiffMean(MeanActivation):
                     1, activations.shape[1])[real_mask]
                 positive_activations.append(acts[labels == 1])
                 negative_activations.append(acts[labels != 1])
+                if not _printed:
+                    print(f"[shape-check][MeanTokenDiffMean] activations.shape (expect [batch, seq_len, hidden]) = {tuple(activations.shape)}")
+                    print(f"[shape-check][MeanTokenDiffMean] real_mask.shape (expect [batch, seq_len]) = {tuple(real_mask.shape)}")
+                    print(f"[shape-check][MeanTokenDiffMean] acts.shape after real_mask (expect [n_real_tokens, hidden]) = {tuple(acts.shape)}")
+                    print(f"[shape-check][MeanTokenDiffMean] labels.shape after real_mask (expect [n_real_tokens]) = {tuple(labels.shape)}")
+                    _printed = True
 
-        mean_positive_activation = torch.cat(positive_activations, dim=0).mean(dim=0)
-        mean_negative_activation = torch.cat(negative_activations, dim=0).mean(dim=0)
+        pos_cat = torch.cat(positive_activations, dim=0)
+        neg_cat = torch.cat(negative_activations, dim=0)
+        print(f"[shape-check][MeanTokenDiffMean] cat(positive_activations).shape (expect [N_total_pos_tokens, hidden]) = {tuple(pos_cat.shape)}")
+        print(f"[shape-check][MeanTokenDiffMean] cat(negative_activations).shape (expect [N_total_neg_tokens, hidden]) = {tuple(neg_cat.shape)}")
+        mean_positive_activation = pos_cat.mean(dim=0)
+        mean_negative_activation = neg_cat.mean(dim=0)
+        print(f"[shape-check][MeanTokenDiffMean] mean_positive_activation.shape (expect [hidden]) = {tuple(mean_positive_activation.shape)}")
         self.ax.proj.weight.data = \
             mean_positive_activation.unsqueeze(0) - mean_negative_activation.unsqueeze(0)
+        print(f"[shape-check][MeanTokenDiffMean] self.ax.proj.weight.data.shape (expect [1, hidden]) = {tuple(self.ax.proj.weight.data.shape)}")
         set_decoder_norm_to_unit_norm(self.ax)
 
 
@@ -533,6 +546,7 @@ class LastTokenDiffMean(MeanTokenDiffMean):
         prefix_length = kwargs["prefix_length"]
 
         positive_activations, negative_activations = [], []
+        _printed = False
         for _ in range(self.training_args.n_epochs):
             for batch in train_dataloader:
                 inputs = {k: v.to(self.device) for k, v in batch.items()}
@@ -547,11 +561,23 @@ class LastTokenDiffMean(MeanTokenDiffMean):
                 valid = inputs["attention_mask"].sum(dim=1) > prefix_length
                 positive_activations.append(acts[valid & (labels == 1)])
                 negative_activations.append(acts[valid & (labels != 1)])
+                if not _printed:
+                    print(f"[shape-check][LastTokenDiffMean] activations.shape (expect [batch, seq_len, hidden]) = {tuple(activations.shape)}")
+                    print(f"[shape-check][LastTokenDiffMean] acts.shape after [:, -1, :] slice (expect [batch, hidden]) = {tuple(acts.shape)}")
+                    print(f"[shape-check][LastTokenDiffMean] labels.shape (expect [batch]) = {tuple(labels.shape)}")
+                    print(f"[shape-check][LastTokenDiffMean] valid.shape (expect [batch]) = {tuple(valid.shape)}")
+                    _printed = True
 
-        mean_positive_activation = torch.cat(positive_activations, dim=0).mean(dim=0)
-        mean_negative_activation = torch.cat(negative_activations, dim=0).mean(dim=0)
+        pos_cat = torch.cat(positive_activations, dim=0)
+        neg_cat = torch.cat(negative_activations, dim=0)
+        print(f"[shape-check][LastTokenDiffMean] cat(positive_activations).shape (expect [N_total_pos_examples, hidden]) = {tuple(pos_cat.shape)}")
+        print(f"[shape-check][LastTokenDiffMean] cat(negative_activations).shape (expect [N_total_neg_examples, hidden]) = {tuple(neg_cat.shape)}")
+        mean_positive_activation = pos_cat.mean(dim=0)
+        mean_negative_activation = neg_cat.mean(dim=0)
+        print(f"[shape-check][LastTokenDiffMean] mean_positive_activation.shape (expect [hidden]) = {tuple(mean_positive_activation.shape)}")
         self.ax.proj.weight.data = \
             mean_positive_activation.unsqueeze(0) - mean_negative_activation.unsqueeze(0)
+        print(f"[shape-check][LastTokenDiffMean] self.ax.proj.weight.data.shape (expect [1, hidden]) = {tuple(self.ax.proj.weight.data.shape)}")
         set_decoder_norm_to_unit_norm(self.ax)
 
 
@@ -621,11 +647,18 @@ class DiffMeanPositional(MeanTokenDiffMean):
         self.ax.to(self.device)
 
         hidden_size = self.model.config.hidden_size
+        prefix_length = kwargs["prefix_length"]
         positive_sum = torch.zeros(num_positions, hidden_size, device=self.device)
         negative_sum = torch.zeros(num_positions, hidden_size, device=self.device)
         positive_count = torch.zeros(num_positions, device=self.device)
         negative_count = torch.zeros(num_positions, device=self.device)
+        # rows with a real (non-padding, past the chat-template prefix) token per slot;
+        # only used by subclasses that reweight positions (see _scale_positions)
+        real_count = torch.zeros(num_positions, device=self.device)
+        print(f"[shape-check][DiffMeanPositional] positive_sum.shape (expect [num_positions, hidden]) = {tuple(positive_sum.shape)}")
+        print(f"[shape-check][DiffMeanPositional] positive_count.shape (expect [num_positions]) = {tuple(positive_count.shape)}")
 
+        _printed = False
         for _ in range(self.training_args.n_epochs):
             for batch in train_dataloader:
                 inputs = {k: v.to(self.device) for k, v in batch.items()}
@@ -652,6 +685,14 @@ class DiffMeanPositional(MeanTokenDiffMean):
                 negative_sum[-n:] += acts[is_negative].sum(dim=0)
                 positive_count[-n:] += is_positive.sum()
                 negative_count[-n:] += is_negative.sum()
+                real = self._real_token_mask(inputs["attention_mask"], prefix_length)[:, -n:]
+                real_count[-n:] += real.sum(dim=0)
+                if not _printed:
+                    print(f"[shape-check][DiffMeanPositional] n (expect min(num_positions, seq_len)) = {n}")
+                    print(f"[shape-check][DiffMeanPositional] activations.shape (expect [batch, seq_len, hidden]) = {tuple(activations.shape)}")
+                    print(f"[shape-check][DiffMeanPositional] acts.shape after [:, -n:, :] slice (expect [batch, n, hidden]) = {tuple(acts.shape)}")
+                    print(f"[shape-check][DiffMeanPositional] real.shape (expect [batch, n]) = {tuple(real.shape)}")
+                    _printed = True
 
         empty = ((positive_count == 0) | (negative_count == 0)).nonzero().flatten().tolist()
         if empty:
@@ -661,15 +702,33 @@ class DiffMeanPositional(MeanTokenDiffMean):
 
         weight = (positive_sum / positive_count.clamp(min=1).unsqueeze(1)) - \
             (negative_sum / negative_count.clamp(min=1).unsqueeze(1))
+        print(f"[shape-check][DiffMeanPositional] weight.shape (expect [num_positions, hidden]) = {tuple(weight.shape)}")
         # normalize each position independently, so the steering_factors sweep means the
         # same thing at every position (as it does for the single-vector methods)
         eps = torch.finfo(weight.dtype).eps
-        self.positional_weight = weight / (weight.norm(dim=1, keepdim=True) + eps)
+        unit_weight = weight / (weight.norm(dim=1, keepdim=True) + eps)
+        print(f"[shape-check][DiffMeanPositional] unit_weight.shape (expect [num_positions, hidden]) = {tuple(unit_weight.shape)}")
+        # share of rows (positives and negatives together) with a real token at each
+        # slot; a slot no row reached (0/0) gets 0, and its vector is already zero
+        total_count = positive_count + negative_count
+        self.real_frac = real_count / total_count.clamp(min=1)
+        print(f"[shape-check][DiffMeanPositional] self.real_frac.shape (expect [num_positions]) = {tuple(self.real_frac.shape)}")
+        self.positional_weight = self._scale_positions(unit_weight, self.real_frac)
+        print(f"[shape-check][DiffMeanPositional] self.positional_weight.shape (expect [num_positions, hidden]) = {tuple(self.positional_weight.shape)}")
 
         # collapsed direction, used by latent/detection mode
         collapsed = self.positional_weight.mean(dim=0, keepdim=True)
+        print(f"[shape-check][DiffMeanPositional] collapsed.shape (expect [1, hidden]) = {tuple(collapsed.shape)}")
         self.ax.proj.weight.data = collapsed.to(self.ax.proj.weight.dtype)
         set_decoder_norm_to_unit_norm(self.ax)
+
+    def _scale_positions(self, unit_weight, real_frac):
+        """Hook for reweighting the unit per-position vectors; identity here."""
+        return unit_weight
+
+    def _extra_checkpoint_tensors(self):
+        """Hook for extra per-concept tensors to save alongside the weights (dim 0 = concept)."""
+        return {}
 
     def save(self, dump_dir, **kwargs):
         """Save both directions into the standard {model_name}_weight.pt as a dict.
@@ -686,6 +745,7 @@ class DiffMeanPositional(MeanTokenDiffMean):
             # column order (slot -1 = final token). Named distinctly from the old
             # reversed-order "positional" key so a stale checkpoint can't load silently.
             "positional_col": self.positional_weight.data.cpu().unsqueeze(0),   # 1, num_positions, h
+            **self._extra_checkpoint_tensors(),
         }
         if weight_file.exists():
             previous = torch.load(weight_file, weights_only=True)
@@ -721,3 +781,28 @@ class DiffMeanPositional(MeanTokenDiffMean):
             self.make_model(**kwargs)
             self.ax.proj.weight.data = weight["collapsed"].to(self.device)
             self.ax.proj.bias.data = bias.to(self.device)
+
+class DiffMeanPositionalWeighted(DiffMeanPositional):
+    """DiffMeanPositional with each position's unit vector scaled by its coverage r_k.
+
+    r_k is the share of training rows (positives and negatives together) with a real
+    token at slot k -- not left-padding and past the chat-template prefix, i.e. a token
+    that can see the example's content. The trailing generation header counts as real:
+    it attends to the content. Deep slots that only a few long examples reach are mostly
+    padding in the unmasked mean, so their unit-normalized vectors are noisy yet steer at
+    full strength in DiffMeanPositional; here they are down-weighted instead.
+
+    The saved per-position vectors are r_k * v_k and are NOT renormalized, so steering
+    at slot k uses r_k * factor * max_act. The collapsed latent direction is the mean of
+    the scaled vectors, renormalized to unit length as before, so max_act comes from a
+    coverage-weighted direction in the usual units. r_k is saved as "real_frac".
+    """
+
+    def __str__(self):
+        return 'DiffMeanPositionalWeighted'
+
+    def _scale_positions(self, unit_weight, real_frac):
+        return unit_weight * real_frac.unsqueeze(1)
+
+    def _extra_checkpoint_tensors(self):
+        return {"real_frac": self.real_frac.cpu().unsqueeze(0)}   # 1, num_positions

@@ -305,6 +305,9 @@ class Model(BaseModel):
         all_generations = []
         all_perplexities = []
         all_strenghts = []
+        # optional SteeringNormRecorder, already attached by the caller (inference.py
+        # capture_norms); None leaves this method exactly as before
+        norm_recorder = kwargs.get("norm_recorder", None)
         # Main training loop.
         rank = torch.distributed.get_rank()
         progress_bar = tqdm(range(0, len(examples), batch_size), position=rank, leave=True)
@@ -325,14 +328,20 @@ class Model(BaseModel):
             inputs = self.tokenizer(
                 input_strings, return_tensors="pt", padding=True, truncation=True
             ).to(self.device)
+            if norm_recorder is not None:
+                norm_recorder.reset()
             _, generations = self.ax_model.generate(
-                inputs, 
-                unit_locations=None, intervene_on_prompt=True, 
-                subspaces=[{"idx": idx, "mag": mag, "max_act": max_acts, 
+                inputs,
+                unit_locations=None, intervene_on_prompt=True,
+                subspaces=[{"idx": idx, "mag": mag, "max_act": max_acts,
                             "prefix_length": kwargs["prefix_length"]}]*self.num_of_layers,
-                max_new_tokens=eval_output_length, do_sample=True, 
+                max_new_tokens=eval_output_length, do_sample=True,
                 temperature=temperature,
             )
+            if norm_recorder is not None:
+                norm_recorder.record_batch(
+                    batch_examples, inputs.attention_mask, generations, mag, max_acts,
+                    self.tokenizer)
 
             # Decode and print only the generated text without prompt tokens
             input_lengths = [len(input_ids) for input_ids in inputs.input_ids]

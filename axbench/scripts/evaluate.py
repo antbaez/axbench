@@ -3,6 +3,10 @@
 # example launch command:
 #     python axbench/scripts/evaluate.py --config axbench/demo/sweep/evaluate.yaml --mode latent
 
+import warnings
+warnings.filterwarnings("ignore", message=r"pyreft not installed.*")
+warnings.filterwarnings("ignore", message=r"HyperSteer unavailable.*")
+
 import shutil
 from axbench.models.language_models import (
     LanguageModel

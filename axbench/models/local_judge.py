@@ -12,6 +12,7 @@ evaluator.py (make_llm / generate_in_batches).
 
 import os
 import logging
+import re
 
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "OFF")
@@ -28,6 +29,14 @@ SEED = 42
 JUDGE_MODEL_NAME = "unsloth/Meta-Llama-3.1-70B-Instruct-bnb-4bit"
 TOKENIZER_MODEL_NAME = "meta-llama/Llama-3.1-70B-Instruct"
 
+# A judge answer that never reaches "Rating:" parses as 0.0 (lm_judge.py's
+# DEFAULT_RATING) -- indistinguishable from a genuine "concept absent" verdict.
+# So any completion that ran out of budget mid-explanation is continued with
+# FORCE_RATING_SUFFIX appended to its own text, which leaves the model no choice
+# but to emit the score next. Only the number is kept from that continuation.
+FORCE_RATING_SUFFIX = "\n\nRating: [["
+FORCE_RATING_MAX_TOKENS = 6
+
 
 class LocalLanguageModel(object):
     """Same call surface as axbench.models.language_models.LanguageModel,
@@ -38,7 +47,7 @@ class LocalLanguageModel(object):
         model_name=None,
         tokenizer_name=None,
         temperature=0.0,
-        max_tokens=512,
+        max_tokens=256,
         batch_size=256,
         **kwargs,
     ):
@@ -111,7 +120,7 @@ class LocalLanguageModel(object):
                     flush=True,
                 )
 
-            yield [r.outputs[0].text for r in results]
+            yield [(r.outputs[0].text, r.outputs[0].finish_reason) for r in results]
 
     async def chat_completions(self, api_names, prompts, batch_size=None):
         """Same signature as LanguageModel.chat_completions: returns a list of
@@ -126,18 +135,66 @@ class LocalLanguageModel(object):
         rather than editing lm_judge.py (shared with the OpenAI path)."""
         batch_size = self.batch_size
         rendered_prompts = [self._render_prompt(p) for p in prompts]
+        # Reserve the last FORCE_RATING_MAX_TOKENS of the budget: the reasoning pass
+        # stops that much short of max_tokens, so an answer that is about to run out
+        # of room still has room left for a forced rating (see _force_missing_ratings).
         sampling_params = SamplingParams(
             temperature=self.temperature,
             top_p=1.0,
             top_k=-1,
-            max_tokens=self.max_tokens,
+            max_tokens=max(self.max_tokens - FORCE_RATING_MAX_TOKENS, 1),
             seed=SEED,
         )
-        all_completions = []
+        all_completions, finish_reasons = [], []
         for batch in self._generate_in_batches(rendered_prompts, sampling_params, batch_size):
-            all_completions.extend(text.strip() for text in batch)
+            all_completions.extend(text.strip() for text, _ in batch)
+            finish_reasons.extend(reason for _, reason in batch)
+        all_completions = self._force_missing_ratings(
+            rendered_prompts, all_completions, finish_reasons, batch_size)
         self.total_calls += len(prompts)
         return all_completions
+
+    def _force_missing_ratings(self, rendered_prompts, completions, finish_reasons, batch_size):
+        """Append the rating to any answer that was cut off mid-reasoning.
+
+        An answer is continued when it stopped because it ran out of budget
+        (finish_reason == "length") and has not written "Rating:" yet. The judge's own
+        partial reasoning is fed back with FORCE_RATING_SUFFIX appended, so the very next
+        tokens it writes are the score -- forced into its trace at the point it would
+        otherwise have been truncated, rather than after the fact. Reasoning and forced
+        rating together stay within max_tokens. Only the number is kept from the
+        continuation, and the reasoning the judge did write is left untouched.
+        """
+        missing = [i for i, (c, r) in enumerate(zip(completions, finish_reasons))
+                   if "Rating:" not in c and r == "length"]
+        stopped_without_rating = sum(
+            1 for c, r in zip(completions, finish_reasons) if "Rating:" not in c and r != "length")
+        if stopped_without_rating:
+            print(f"[local_judge] {stopped_without_rating}/{len(completions)} completions ended on "
+                  f"their own without a rating -- those score 0", flush=True)
+        if not missing:
+            return completions
+        print(f"[local_judge] {len(missing)}/{len(completions)} completions ran out of reasoning "
+              f"budget ({self.max_tokens - FORCE_RATING_MAX_TOKENS} tokens); forcing the rating "
+              f"into the trace", flush=True)
+        forced_prompts = [rendered_prompts[i] + completions[i] + FORCE_RATING_SUFFIX for i in missing]
+        sampling_params = SamplingParams(
+            temperature=self.temperature, top_p=1.0, top_k=-1,
+            max_tokens=FORCE_RATING_MAX_TOKENS, seed=SEED)
+        continuations = []
+        for batch in self._generate_in_batches(forced_prompts, sampling_params, batch_size):
+            continuations.extend(text for text, _ in batch)
+        unparsed = 0
+        for i, cont in zip(missing, continuations):
+            m = re.search(r"\d+(?:\.\d+)?", cont)
+            if m:
+                completions[i] = f"{completions[i]}{FORCE_RATING_SUFFIX}{m.group()}]]"
+            else:
+                unparsed += 1
+        if unparsed:
+            print(f"[local_judge] {unparsed} forced continuation(s) still had no number "
+                  f"-- those score 0", flush=True)
+        return completions
 
     def get_report(self):
         return {

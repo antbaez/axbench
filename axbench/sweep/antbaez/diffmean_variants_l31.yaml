@@ -2,8 +2,12 @@ generate:
   lm_model: "gpt-4o-mini"
   output_length: 128
   num_of_examples: 144
-  concept_path: "axbench/data/gemma-2-9b_31-gemmascope-res-16k.json"
+  # one pool of base instructions, shared by every concept and every stage
+  num_base_instructions: 72
+  concept_path: "axbench/data/gemma-2-9b-it_31-gemmascope-res-131k.json"
   max_concepts: 500
+  # text concepts from concept500 go first; the rest are random text concepts from concept_path
+  seed_concepts_dir: "axbench/concept500/prod_9b_l31_v1/generate"
   master_data_dir: "axbench/data"
   dataset_category: "instruction"
   lm_use_cache: false
@@ -15,12 +19,6 @@ train:
   seed: 42
   use_bf16: true
   models:
-    # kept as the reference point: right-padded, unchanged from no_grad.yaml
-    DiffMean:
-      batch_size: 24
-      n_epochs: 1
-      binarize_dataset: true
-      low_rank_dimension: 1
     # left-padded equivalent of DiffMean; should match it within bf16 noise
     MeanTokenDiffMean:
       batch_size: 24
@@ -33,15 +31,22 @@ train:
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
-    DiffMeanPositional:
+    # DiffMeanPositional:
+    #   batch_size: 24
+    #   n_epochs: 1
+    #   binarize_dataset: true
+    #   low_rank_dimension: 1
+    #   num_positions: 64
+    # each position scaled by its coverage r_k (see CLAUDE.md sec. 3)
+    DiffMeanPositionalWeighted:
       batch_size: 24
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
-      num_positions: 32
+      num_positions: 64
 inference:
   use_bf16: true
-  models: ["DiffMean", "MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositional"]
+  models: ["MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositionalWeighted"]
   model_name: "google/gemma-2-9b-it"
   # latent related params
   output_length: 128
@@ -50,26 +55,35 @@ inference:
   # steering related params
   steering_intervention_type: "addition" # clamping
   steering_model_name: "google/gemma-2-9b-it"
-  steering_datasets: ["AlpacaEval"]
+  steering_datasets: ["ContrastInstructions"]
   steering_batch_size: 140
-  steering_output_length: 128
+  steering_output_length: 512
   steering_layers: [31]
   steering_num_of_examples: 10 # number of examples per concept and per factor
-  steering_factors: [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0, 4.0, 5.0] # number of steering factors per example
+  # which seed_instructions split ContrastInstructions builds steering prompts from.
+  # "train" (default) reuses the pool the training examples came from; "test" uses the held-out pool
+  steering_instructions_dist: "test"
+  # 1 = inject the random contrast concept directly, one prompt; 2 (old default) =
+  # inject the target concept first, then minimally edit toward the contrast concept
+  random_concept_injection_n_steps: 1
+  capture_norms: true #record per-token layer-31 residual norms
+  # steering_factors: [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] # number of steering factors per example
+  steering_factors: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
   # master data dir is shared across all jobs.
   master_data_dir: "axbench/data"
   seed: 42
   lm_model: "gpt-4o-mini"
+  lm_use_cache: false
   # generation related params
   temperature: 1.0
 evaluate:
-  models: ["DiffMean", "MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositional"]
+  models: ["MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositionalWeighted"]
   latent_evaluators: [
     "AUCROCEvaluator",
     "HardNegativeEvaluator",
   ]
   steering_evaluators: [
-    "PerplexityEvaluator",
     "LMJudgeEvaluator",
   ]
   winrate_split_ratio: 0.5 # this is for steering only, we use a separate partition for factor selection.

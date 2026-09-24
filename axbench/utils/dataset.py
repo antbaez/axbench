@@ -188,6 +188,10 @@ def get_best_factors_rule(steered_data, type_):
 #
 # Delete a file to get a fresh one on the next run; otherwise it is frozen.
 BASE_INSTRUCTIONS_FILE = "base_instructions.json"
+# held-out counterpart, drawn from the seed_instructions *_test split; written next to
+# the train pool by generate.py --mode training and selected with the inference config's
+# steering_instructions_dist
+BASE_INSTRUCTIONS_TEST_FILE = "base_instructions_test.json"
 CONTRASTIVE_CONCEPTS_FILE = "contrastive_concepts.json"
 
 
@@ -198,19 +202,32 @@ STEERING_EVAL_FILE = "steering_eval_data.parquet"
 STEERING_EVAL_CACHE_DIR = "steering_eval_cache"
 
 
-def _steering_eval_paths(dump_dir):
+def _instructions_suffix(dist):
+    """Filename suffix keeping the instruction distributions' files apart."""
+    if dist not in ("train", "test", "alpaca"):
+        raise ValueError(
+            f"steering_instructions_dist must be 'train', 'test', or 'alpaca', got {dist!r}.")
+    return {"train": "", "test": "_test", "alpaca": "_alpaca"}[dist]
+
+
+def _steering_eval_paths(dump_dir, dist="train"):
+    # Keyed by distribution: the cached prompts record nothing about which pool they
+    # came from, so one shared path would silently serve train-pool prompts to a
+    # test-pool run (and vice versa).
     inference_dir = Path(dump_dir) / "inference"
-    return inference_dir / STEERING_EVAL_FILE, inference_dir / STEERING_EVAL_CACHE_DIR
+    suffix = _instructions_suffix(dist)
+    return (inference_dir / STEERING_EVAL_FILE.replace(".parquet", f"{suffix}.parquet"),
+            inference_dir / f"{STEERING_EVAL_CACHE_DIR}{suffix}")
 
 
-def consolidate_steering_eval_cache(dump_dir, logger=logger):
+def consolidate_steering_eval_cache(dump_dir, logger=logger, dist="train"):
     """
     Fold the per-concept steering prompt cache files into steering_eval_data.parquet
     (per-concept files win over rows already there), then delete them. A lock file
     keeps two racing mergers from both rewriting the file; the loser just skips, and
     any files it leaves behind are still read as cache and folded in next time.
     """
-    merged_path, cache_dir = _steering_eval_paths(dump_dir)
+    merged_path, cache_dir = _steering_eval_paths(dump_dir, dist)
     paths = sorted(cache_dir.glob("concept_*.parquet"))
     if not paths:
         return
@@ -261,36 +278,55 @@ def _write_json_atomically(obj, path):
     os.replace(tmp_path, path)
 
 
-def load_base_instructions(data_dir):
-    """The shared pool of base instructions. Raises if it hasn't been created yet."""
-    path = os.path.join(data_dir, BASE_INSTRUCTIONS_FILE)
+def load_base_instructions(data_dir, dist="train"):
+    """The shared pool of base instructions. Raises if it hasn't been created yet.
+
+    dist="alpaca" has no dump-local pool file -- ContrastInstructions reads
+    alpaca_eval.json directly instead of calling this function for that dist.
+    """
+    if dist == "alpaca":
+        raise ValueError(
+            "load_base_instructions has no file for dist='alpaca' -- read "
+            "alpaca_eval.json directly instead.")
+    path = os.path.join(
+        data_dir,
+        BASE_INSTRUCTIONS_FILE if _instructions_suffix(dist) == "" else BASE_INSTRUCTIONS_TEST_FILE)
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"{path} does not exist -- run generate.py --mode training first; it "
-            f"creates the shared base-instruction pool every other stage reads.")
+            f"creates the shared base-instruction pool every other stage reads. A dump "
+            f"generated before steering_instructions_dist existed has no test pool; see "
+            f"CLAUDE.md for the snippet that writes one without regenerating.")
     with open(path) as f:
         return json.load(f)
 
 
-def load_or_create_base_instructions(data_dir, seed_instructions, n, genre="text"):
-    """One pool of n base instructions, shared by every concept and every stage."""
-    path = os.path.join(data_dir, BASE_INSTRUCTIONS_FILE)
+def load_or_create_base_instructions(data_dir, seed_instructions, n, genre="text", dist="train"):
+    """One pool of n base instructions, shared by every concept and every stage.
+
+    dist="test" draws from the {genre}_test split instead and writes the separate
+    held-out pool that steering_instructions_dist: "test" reads.
+    """
+    suffix = _instructions_suffix(dist)
+    path = os.path.join(
+        data_dir, BASE_INSTRUCTIONS_FILE if suffix == "" else BASE_INSTRUCTIONS_TEST_FILE)
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
 
-    dataset = seed_instructions[f"{genre}_train"]
+    split = f"{genre}_{dist}"
+    dataset = seed_instructions[split]
     if n > len(dataset):
         raise ValueError(
             f"num_base_instructions={n} exceeds the {len(dataset)} available in "
-            f"{genre}_train.")
+            f"{split}.")
     # same normalization get_random_content applies to seeds
     instructions = [
         dataset[i]["input"].strip(" .'").strip('"')
         for i in random.sample(range(len(dataset)), n)]
     os.makedirs(data_dir, exist_ok=True)
     _write_json_atomically(instructions, path)
-    logger.warning(f"Created {path} with {n} base instructions from {genre}_train.")
+    logger.warning(f"Created {path} with {n} base instructions from {split}.")
     return instructions
 
 
@@ -304,7 +340,7 @@ def load_contrastive_concepts(data_dir):
 
 
 def load_or_create_contrastive_concepts_batch(lm_model, concepts, data_dir, api_tag=""):
-    """Each concept's 10 unrelated, format-matched contrast concepts, generated once and reused.
+    """Each concept's 72 (two calls of 36) unrelated, format-matched contrast concepts, generated once and reused.
 
     Missing concepts are generated in one batched pass, before any per-concept work,
     so concurrent generation never has to write the store. Persisted so a preempted
@@ -427,6 +463,9 @@ class DatasetFactory(object):
 
     def reset_stats(self):
         """Reset API costs"""
+        # dump() writes cost.jsonl and the prompt log; that is unrelated to whether
+        # completions are cached, so it runs either way.
+        self.lm_model.dump()
         self.lm_model.stats.print_report()
         self.lm_model.stats.reset()
 
@@ -645,9 +684,10 @@ class DatasetFactory(object):
                 lm_model, self.tokenizer,
                 concepts=seed_concepts, content=base_instructions, length=output_length)
             concept_outputs = asyncio.run(run_tasks([continue_task]))[0]
-            for prompt, output in zip(base_instructions, concept_outputs):
+            for base_instruction, output in zip(base_instructions, concept_outputs):
                 all_examples += [[
-                    prompt, output, concept, genre, "positive", self.dataset_category, ""
+                    base_instruction, output, concept, genre, "positive", self.dataset_category, "",
+                    base_instruction
                 ]]
         else:
             # positive instruction: the concept is injected into the instruction. No
@@ -658,9 +698,10 @@ class DatasetFactory(object):
                 concepts=seed_concepts, content=base_instructions)
             concept_instructions = asyncio.run(run_tasks([instruction_task]))[0]
             if "positive" in categories:
-                for prompt in concept_instructions:
+                for base_instruction, prompt in zip(base_instructions, concept_instructions):
                     all_examples += [[
-                        prompt, "", concept, genre, "positive", self.dataset_category, ""
+                        prompt, "", concept, genre, "positive", self.dataset_category, "",
+                        base_instruction
                     ]]
 
             if "negative" in categories:
@@ -673,10 +714,11 @@ class DatasetFactory(object):
                     concepts=seed_concepts, contrast_concepts=sampled_contrast_concepts,
                     content=concept_instructions)
                 related_instructions = asyncio.run(run_tasks([related_task]))[0]
-                for prompt, contrast_concept in zip(related_instructions, sampled_contrast_concepts):
+                for base_instruction, prompt, contrast_concept in zip(
+                        base_instructions, related_instructions, sampled_contrast_concepts):
                     all_examples += [[
                         prompt, "", EMPTY_CONCEPT, genre, "negative", self.dataset_category,
-                        contrast_concept
+                        contrast_concept, base_instruction
                     ]]
 
         # update the column definitions of the DataFrame
@@ -684,7 +726,7 @@ class DatasetFactory(object):
             all_examples,
             columns = [
                 'input', 'output', 'output_concept', 'concept_genre', 'category', 'dataset_category',
-                'contrast_concept'
+                'contrast_concept', 'base_instruction'
             ])
         self.logger.info(f"Finished creating current dataframe in {round(time.time() - start, 3)} sec.")
         return df
@@ -865,6 +907,17 @@ class SteeringDatasetFactory(object):
                 use_cache=self.use_cache, master_data_dir=self.master_data_dir
             )
         self.has_prompt_steering = has_prompt_steering
+        # inference config's steering_instructions_dist: which base-instruction pool
+        # ContrastInstructions draws from, and which prompt cache it uses
+        self.steering_instructions_dist = kwargs.get("steering_instructions_dist", "train")
+        _instructions_suffix(self.steering_instructions_dist)  # fail fast on a typo
+        # inference config's random_concept_injection_n_steps: 1 = inject the contrast
+        # concept directly in one call, 2 (default) = the original inject-then-swap edit
+        self.random_concept_injection_n_steps = kwargs.get("random_concept_injection_n_steps", 2)
+        if self.random_concept_injection_n_steps not in (1, 2):
+            raise ValueError(
+                f"random_concept_injection_n_steps must be 1 or 2, got "
+                f"{self.random_concept_injection_n_steps!r}")
 
 
     def create_eval_df(
@@ -948,11 +1001,11 @@ class SteeringDatasetFactory(object):
             elif dataset_name == "ContrastInstructions":
                 # Steering prompts drawn from the same distribution training was fit on:
                 # base instructions from the shared pool, rewritten to carry a contrast
-                # concept held out from this concept's own 10. They must NOT name the
+                # concept held out from this concept's own pool. They must NOT name the
                 # target concept -- otherwise the model would discuss it unprompted and
                 # the judge would score the prompt rather than the intervention.
                 #
-                # Held out from this concept's own 10 because those are what its training
+                # Held out from this concept's own pool because those are what its training
                 # negatives were built from: the direction was fit to not respond to them,
                 # so evaluating on them tests material the vector was already tuned against.
                 #
@@ -963,7 +1016,8 @@ class SteeringDatasetFactory(object):
                 # into steering_eval_data.parquet. Delete both to get a fresh set.
                 assert dump_dir is not None, "dump_dir is required for ContrastInstructions."
                 data_dir = os.path.join(dump_dir, "generate")
-                merged_path, cache_dir = _steering_eval_paths(dump_dir)
+                dist = self.steering_instructions_dist
+                merged_path, cache_dir = _steering_eval_paths(dump_dir, dist)
                 concept_cache_path = cache_dir / f"concept_{concept_id}.parquet"
 
                 cached_df = None
@@ -980,7 +1034,13 @@ class SteeringDatasetFactory(object):
                 if cached_df is not None:
                     prompt_rows = cached_df
                 else:
-                    base_instructions = load_base_instructions(data_dir)
+                    if dist == "alpaca":
+                        assert self.master_data_dir is not None, (
+                            "master_data_dir is required for steering_instructions_dist='alpaca'.")
+                        alpaca_eval_path = os.path.join(self.master_data_dir, "alpaca_eval.json")
+                        base_instructions = pd.read_json(alpaca_eval_path)["instruction"].tolist()
+                    else:
+                        base_instructions = load_base_instructions(data_dir, dist)
                     contrastive_store = load_contrastive_concepts(data_dir)
                     concept = concepts[0]
                     if concept not in contrastive_store:
@@ -992,7 +1052,7 @@ class SteeringDatasetFactory(object):
                         base_instructions, min(subset_n, len(base_instructions)))
                     # Excluded by value, not just by key: with concepts generated
                     # independently per source concept, the same generic concept can
-                    # surface under several of them, including this one's own 10.
+                    # surface under several of them, including this one's own pool.
                     own = set(contrastive_store[concept])
                     held_out = sorted({
                         c for other, items in contrastive_store.items() if other != concept
@@ -1004,22 +1064,32 @@ class SteeringDatasetFactory(object):
                             f"{CONTRASTIVE_CONCEPTS_FILE} in {data_dir} needs entries for "
                             f"more than one concept.")
                     contrast_concepts = assign_contrast_concepts(held_out, len(sampled))
-                    # inject the concept first, then swap it out: the negative is a
-                    # minimal edit of its own positive, not of the bare instruction.
-                    positives = asyncio.run(run_tasks([instruction_with_concept(
-                        self.lm_model, self.tokenizer,
-                        concepts=[concept] * len(sampled), content=sampled)]))[0]
-                    negatives = asyncio.run(run_tasks([instruction_with_related_concept(
-                        self.lm_model, self.tokenizer,
-                        concepts=[concept] * len(positives),
-                        contrast_concepts=contrast_concepts, content=positives)]))[0]
+                    if self.random_concept_injection_n_steps == 1:
+                        # inject the (random, held-out) contrast concept directly --
+                        # one call, reusing instruction_with_concept's own wording,
+                        # pointed at the contrast concept instead of the target one.
+                        injected = asyncio.run(run_tasks([instruction_with_concept(
+                            self.lm_model, self.tokenizer,
+                            concepts=contrast_concepts, content=sampled)]))[0]
+                    else:
+                        # inject the concept first, then swap it out: the negative is a
+                        # minimal edit of its own positive, not of the bare instruction.
+                        positives = asyncio.run(run_tasks([instruction_with_concept(
+                            self.lm_model, self.tokenizer,
+                            concepts=[concept] * len(sampled), content=sampled)]))[0]
+                        injected = asyncio.run(run_tasks([instruction_with_related_concept(
+                            self.lm_model, self.tokenizer,
+                            concepts=[concept] * len(positives),
+                            contrast_concepts=contrast_concepts, content=positives)]))[0]
 
                     prompt_rows = pd.DataFrame({
                         "concept_id": concept_id,
                         "input_concept": concept,
-                        "input_id": list(range(len(negatives))),
-                        "input": negatives,
-                        "contrast_concept": contrast_concepts[:len(negatives)],
+                        "input_id": list(range(len(injected))),
+                        "input": injected,
+                        "contrast_concept": contrast_concepts[:len(injected)],
+                        "instructions_dist": dist,
+                        "base_instruction": sampled[:len(injected)],
                     })
                     cache_dir.mkdir(parents=True, exist_ok=True)
                     tmp_path = cache_dir / f"concept_{concept_id}.parquet.tmp.{os.getpid()}"
@@ -1042,13 +1112,14 @@ class SteeringDatasetFactory(object):
                         all_examples += [[
                             dataset_name, 0, row.input_concept,
                             i, factor, row.input, formatted_prompt, formatted_prompt,
-                            "", "", "", []
+                            "", "", "", [], row.base_instruction
                         ]]
                 df = pd.DataFrame(
                     all_examples,
                     columns = [
                         'dataset_name', 'concept_id', 'input_concept',
-                        'input_id', 'factor', 'original_prompt', 'steered_input', 'input', "suppress_original", "suppress_rewrite", "steered_prompt", "defense"])
+                        'input_id', 'factor', 'original_prompt', 'steered_input', 'input', "suppress_original", "suppress_rewrite", "steered_prompt", "defense",
+                        'base_instruction'])
                 all_dfs.append(df)
 
             elif dataset_name == "AlpacaEvalSuppress":

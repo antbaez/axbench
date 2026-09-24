@@ -13,4 +13,4 @@ bash download-9b.sh
 bash download-alpaca.sh
 
 cd ../..
-uv run download_from_hf.py
+uv run my_utils/download_from_hf.py

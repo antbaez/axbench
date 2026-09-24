@@ -53,7 +53,7 @@ class LMJudgeEvaluator(Evaluator):
     def _get_ratings_from_prompts(self, prompts, api_name, min_rating=0.0, max_rating=2.0):
         async def process_batch():
             return await self.lm_model.chat_completions(
-                f"{api_name}_{self.model_name}_LMJudgeEvaluator", prompts, batch_size=16
+                f"{api_name}_{self.model_name}_LMJudgeEvaluator", prompts, batch_size=8
             )
 
         # If we're already in an event loop, use that

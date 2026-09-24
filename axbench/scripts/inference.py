@@ -2,7 +2,12 @@
 #
 # example launch command:
 #     torchrun --nproc_per_node=NUM_GPUS axbench/scripts/inference.py --config axbench/demo/sweep/inference.yaml --mode latent
+import warnings
+warnings.filterwarnings("ignore", message=r"pyreft not installed.*")
+warnings.filterwarnings("ignore", message=r"HyperSteer unavailable.*")
+
 import os, argparse, yaml, json, glob, pickle, re, time, itertools, datetime, uuid
+import contextlib
 import shutil
 import pandas as pd
 from tqdm.auto import tqdm
@@ -18,6 +23,7 @@ from axbench.utils.dataset import (
 )
 from axbench.utils.constants import * 
 from axbench.utils.model_utils import get_prefix_length, get_suffix_length
+from axbench.utils.norm_capture import SteeringNormRecorder
 from axbench.scripts.args.dataset_args import DatasetArgs
 from axbench.scripts.args.training_args import TrainingArgs
 from transformers import set_seed
@@ -365,6 +371,8 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             has_prompt_steering = False
     dataset_factory = SteeringDatasetFactory(
         tokenizer, dump_dir,
+        steering_instructions_dist=getattr(args, "steering_instructions_dist", "train"),
+        random_concept_injection_n_steps=getattr(args, "random_concept_injection_n_steps", 2),
         master_data_dir=args.master_data_dir, lm_client=lm_client,
         lm_model=args.lm_model, use_cache=args.lm_use_cache,
         has_prompt_steering=has_prompt_steering
@@ -412,37 +420,40 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
         )
         data_per_concept[concept_id] = (current_df, sae_link, sae_id)
 
-    # Debug dump: base prompts actually fed to the model for the first 10 concepts
+    # Preview dump: base prompts actually fed to the model for the first 10 concepts
     # (by concept_id, not just this shard's first 10), so a run's prompts can be
     # sanity-checked without digging through the full steering_data.parquet.
     first_ten_concepts = [c for c in concept_ids[:10] if c in data_per_concept]
     if first_ten_concepts:
-        base_prompts_debug = {}
+        base_prompts_preview = {}
         for concept_id in first_ten_concepts:
             current_df, _, _ = data_per_concept[concept_id]
-            base_prompts_debug[str(concept_id)] = (
-                current_df.drop_duplicates(subset="input_id")
-                .sort_values("input_id")["input"]
-                .tolist()[:10]
-            )
-        debug_path = Path(overwrite_inference_dump_dir) / f"base_prompts_debug{chunk_tag(chunk)}_rank{rank}.json"
-        debug_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(debug_path, "w") as f:
-            json.dump(base_prompts_debug, f, indent=2)
-        logger.warning(f"Wrote base prompts for concepts {first_ten_concepts} to {debug_path}")
+            preview_rows = current_df.drop_duplicates(subset="input_id").sort_values("input_id")[:10]
+            base_prompts_preview[str(concept_id)] = [
+                {
+                    "prompt": row["input"],
+                    "contrast_concept": row["contrast_concept"] if "contrast_concept" in current_df.columns else None,
+                }
+                for _, row in preview_rows.iterrows()
+            ]
+        preview_path = Path(overwrite_inference_dump_dir) / f"base_prompts_preview{chunk_tag(chunk)}_rank{rank}.json"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(preview_path, "w") as f:
+            json.dump(base_prompts_preview, f, indent=2)
+        logger.warning(f"Wrote base prompts for concepts {first_ten_concepts} to {preview_path}")
 
-    # Debug dump: prompt + every model's generation, for the first 10 input_ids x
+    # Preview dump: prompt + every model's generation, for the first 10 input_ids x
     # every steering factor, for the first 10 concepts -- written incrementally as
     # each of those concepts finishes (not batched at the end), so a preempted run
     # keeps whatever it already produced. Pre-loaded from disk so a resumed run
     # (which skips concepts already done in an earlier attempt, see
     # last_concept_id_processed above) doesn't lose entries a prior attempt wrote.
     sample_generations_path = (
-        Path(overwrite_inference_dump_dir) / f"sample_generations_debug{chunk_tag(chunk)}_rank{rank}.json")
-    sample_generations_debug = {}
+        Path(overwrite_inference_dump_dir) / f"sample_generations_preview{chunk_tag(chunk)}_rank{rank}.json")
+    sample_generations_preview = {}
     if first_ten_concepts and sample_generations_path.exists():
         with open(sample_generations_path) as f:
-            sample_generations_debug = json.load(f)
+            sample_generations_preview = json.load(f)
 
     # Preload models that are shared across concepts, like HyperSteer.
     preloaded_models = dict()
@@ -468,9 +479,19 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             )
             preloaded_models[model_name] = benchmark_model
 
+    # capture_norms: record the layer-`layer` residual norm at every token of every
+    # steered forward pass, straight from the intervention hook (no extra inference).
+    # One parquet per concept under inference/norms/, written as each concept finishes.
+    capture_norms = bool(getattr(args, "capture_norms", False))
+    norms_dir = Path(overwrite_inference_dump_dir) / "norms"
+    if capture_norms:
+        norms_dir.mkdir(parents=True, exist_ok=True)
+        logger.warning(f"capture_norms is on: writing per-token layer-{layer} norms to {norms_dir}")
+
     # Now loop over concept_ids and use preloaded models
     for concept_id in my_concept_ids:
         current_df, sae_link, sae_id = data_per_concept[concept_id]
+        concept_norm_records = []
         for model_name in args.models:
             if model_name in STEERING_EXCLUDE_MODELS:
                 continue
@@ -537,19 +558,38 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
                         f"would steer at factor x 1.0. Merge every latent chunk first.")
             unique_concept_ids = list(set(current_df["concept_id"].tolist()))
             logger.warning(f"Inference steering with {model_name} on {device} for concept {concept_id}.")
-            # Run prediction
-            results = benchmark_model.predict_steer(
-                current_df, concept_id=unique_concept_ids[0] if len(unique_concept_ids) == 1 else unique_concept_ids, sae_link=None, sae_id=None,
-                batch_size=int(args.steering_batch_size),
-                eval_output_length=int(args.steering_output_length), 
-                temperature=float(args.temperature),
-                prefix_length=prefix_length,
-                positions=training_args.models[model_name].intervention_positions if model_name not in {"PromptSteering", "GemmaScopeSAE"} else None,
-                use_synergy=False,
-                disable_neuronpedia_max_act=args.disable_neuronpedia_max_act,
-                intervene_on_prompt=args.intervene_on_prompt if args.intervene_on_prompt is not None else True,
-                return_vector=False,
-            )
+            norm_recorder = None
+            if capture_norms:
+                ax = getattr(benchmark_model, "ax", None)
+                if ax is None or isinstance(ax, list) or not hasattr(benchmark_model, "ax_model"):
+                    logger.warning(f"capture_norms: {model_name} has no single pyvene "
+                                   f"intervention to hook; skipping its norms.")
+                else:
+                    # the verification prints run once per model, on this rank's first concept
+                    norm_recorder = SteeringNormRecorder(
+                        benchmark_model.model, ax, benchmark_model.layer,
+                        model_name=model_name, verify=(concept_id == my_concept_ids[0]),
+                        logger=logger)
+            # Run prediction; the recorder's hooks are removed on exit even if this raises
+            with norm_recorder if norm_recorder is not None else contextlib.nullcontext():
+                results = benchmark_model.predict_steer(
+                    current_df, concept_id=unique_concept_ids[0] if len(unique_concept_ids) == 1 else unique_concept_ids, sae_link=None, sae_id=None,
+                    batch_size=int(args.steering_batch_size),
+                    eval_output_length=int(args.steering_output_length),
+                    temperature=float(args.temperature),
+                    prefix_length=prefix_length,
+                    positions=training_args.models[model_name].intervention_positions if model_name not in {"PromptSteering", "GemmaScopeSAE"} else None,
+                    use_synergy=False,
+                    disable_neuronpedia_max_act=args.disable_neuronpedia_max_act,
+                    intervene_on_prompt=args.intervene_on_prompt if args.intervene_on_prompt is not None else True,
+                    return_vector=False,
+                    norm_recorder=norm_recorder,
+                )
+            if norm_recorder is not None:
+                if not norm_recorder.records:
+                    logger.warning(f"capture_norms: {model_name} recorded nothing -- its "
+                                   f"predict_steer override does not call the recorder.")
+                concept_norm_records.extend(norm_recorder.records)
             # Store the results in current_df
             for k, v in results.items():
                 current_df[f"{model_name}_{k}"] = v
@@ -566,12 +606,14 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             first_ten_input_ids = sorted(current_df["input_id"].unique())[:10]
             rows = current_df[current_df["input_id"].isin(first_ten_input_ids)].sort_values(
                 ["input_id", "factor"])
-            sample_generations_debug[str(concept_id)] = {
+            sample_generations_preview[str(concept_id)] = {
                 "concept": rows["input_concept"].iloc[0],
                 "generations": [
                     {
                         "input_id": int(row["input_id"]),
                         "factor": float(row["factor"]),
+                        "base_instruction": row["base_instruction"] if "base_instruction" in current_df.columns else None,
+                        "contrast_concept": row["contrast_concept"] if "contrast_concept" in current_df.columns else None,
                         "prompt": row["original_prompt"],
                         "generations": {
                             m: row[f"{m}_steered_generation"] for m in model_names
@@ -582,9 +624,18 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
                 ],
             }
             with open(sample_generations_path, "w") as f:
-                json.dump(sample_generations_debug, f, indent=2, ensure_ascii=False)
+                json.dump(sample_generations_preview, f, indent=2, ensure_ascii=False)
             logger.warning(
                 f"Wrote sample generations for concept {concept_id} to {sample_generations_path}")
+
+        # written before the resume state below, so a preemption in between redoes this
+        # concept rather than skipping it with its norms missing
+        if capture_norms and concept_norm_records:
+            norms_path = norms_dir / f"concept{concept_id}_rank{rank}{chunk_tag(chunk)}.parquet"
+            pd.DataFrame(concept_norm_records).to_parquet(norms_path, engine="pyarrow")
+            logger.warning(
+                f"Saved {len(concept_norm_records)} norm records for concept {concept_id} "
+                f"to {norms_path}")
 
         save(overwrite_inference_dump_dir, 'steering', current_df, rank, chunk=chunk)
         logger.warning(
@@ -637,7 +688,8 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             combined_df = combined_df.sort_values(by=['concept_id', 'input_id', 'factor']).reset_index(drop=True)
             combined_df.to_parquet(Path(dump_dir) / "inference" / "steering_data.parquet", engine='pyarrow')
             logger.warning(f"Saved combined steering inference results to {Path(dump_dir) / 'inference' / 'steering_data.parquet'}")
-            consolidate_steering_eval_cache(dump_dir, logger)
+            consolidate_steering_eval_cache(
+                dump_dir, logger, getattr(args, "steering_instructions_dist", "train"))
         else:
             logger.warning("No results to merge.")
 
@@ -1321,7 +1373,8 @@ def merge_chunks(args, mode, logger, cleanup=False):
             Path(p).unlink(missing_ok=True)
         logger.warning(f"Deleted {len(stale)} merged chunk/state file(s).")
         if mode == "steering":
-            consolidate_steering_eval_cache(args.dump_dir, logger)
+            consolidate_steering_eval_cache(
+                args.dump_dir, logger, getattr(args, "steering_instructions_dist", "train"))
     else:
         logger.warning("Per-chunk files left in place; delete them once you are satisfied.")
 

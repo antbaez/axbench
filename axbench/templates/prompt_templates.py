@@ -273,19 +273,88 @@ T_GENERATE_CONTRASTIVE_CONCEPTS = """Given the concept:
 
 Your task is to:
 
-1. Generate a list of 10 concepts that are unrelated to '{CONCEPT}'. They should not share its topic, domain, or any surface-level word overlap.
-2. Make the 10 concepts diverse: draw each from a different domain, so they are unrelated to one another as well as to '{CONCEPT}'.
+1. Generate a list of 36 concepts that are unrelated to '{CONCEPT}'. They should not share its topic, domain, or any surface-level word overlap.
+2. Make the 36 concepts diverse: draw each from a different domain, so they are unrelated to one another as well as to '{CONCEPT}'.
 3. Write each one in the same format as '{CONCEPT}' -- mirror its phrasing pattern, grammatical structure, approximate length, level of specificity, and capitalization, so that the only thing that differs is the subject matter.
 
 **Formatting Guidelines:**
 
-- Return exactly 10 concepts, one per line.
+- Return exactly 36 concepts, one per line.
 - Do not number the lines or add any bullet points.
 - Do not include any additional text, explanations, or formatting.
 
-**Final Answer:** Return only the 10 concepts, one per line, following the guidelines above."""
+**Final Answer:** Return only the 36 concepts, one per line, following the guidelines above."""
 
 
+# Second call of get_contrastive_concepts: 36 more, shown the first 36 so it doesn't
+# repeat them.
+T_GENERATE_MORE_CONTRASTIVE_CONCEPTS = """Given the concept:
+
+'{CONCEPT}'
+
+and the following concepts that have already been generated as unrelated to it:
+
+{EXISTING_CONCEPTS}
+
+Your task is to:
+
+1. Generate a list of 36 more concepts that are unrelated to '{CONCEPT}'. They should not share its topic, domain, or any surface-level word overlap.
+2. Do not repeat or rephrase any of the concepts already generated above, and draw the new ones from domains those concepts do not cover, so all of them are unrelated to one another as well as to '{CONCEPT}'.
+3. Write each one in the same format as '{CONCEPT}' -- mirror its phrasing pattern, grammatical structure, approximate length, level of specificity, and capitalization, so that the only thing that differs is the subject matter.
+
+**Formatting Guidelines:**
+
+- Return exactly 36 concepts, one per line.
+- Do not number the lines or add any bullet points.
+- Do not include any additional text, explanations, or formatting.
+
+**Final Answer:** Return only the 36 new concepts, one per line, following the guidelines above."""
+
+
+# Used for both generate.py's training negatives and inference.py's
+# random_concept_injection_n_steps=2 steering prompts (via instruction_with_related_concept).
+# Current wording = v5's ("...to shift the concept") plus "length" in item 2. Each more
+# literal wording made the model paste the contrast concept's description verbatim into the
+# negative, so negatives ran longer than their positives (v5 -1.65 tok, v6 -3.0, v8 -5.2)
+# and misaligned DiffMeanPositional's end-aligned slots.
+#
+# v8 wording, kept for reference (73% of negatives pasted the contrast concept verbatim):
+# T_INSTRUCTION_WITH_RELATED_CONCEPT = """Given the following instruction, which relates to '{CONCEPT}':
+#
+# {INSTRUCTION}
+#
+# Your task is to completely replace the concept '{CONCEPT}' with the concept '{CONTRAST_CONCEPT}' by editing the instruction in place:
+#
+# 1. Edit the instruction with the minimum changes necessary so that it relates to '{CONTRAST_CONCEPT}' instead of '{CONCEPT}'.
+# 2. Keep as much of the original instruction's length, wording, and structure, as possible -- only change what is required to completely replace '{CONCEPT}' with '{CONTRAST_CONCEPT}'.
+# 3. Ensure the rewritten instruction logically incorporates '{CONTRAST_CONCEPT}'.
+#
+# **Formatting Guidelines:**
+#
+# - Return only the rewritten instruction.
+# - Write the final content in plain text.
+# - Do not include any additional text, explanations, or formatting.
+#
+# **Final Answer:** Return only the final content, following the guidelines above."""
+#
+# v6/v7a/v7b wording, kept for reference (56% verbatim):
+# T_INSTRUCTION_WITH_RELATED_CONCEPT = """Given the following instruction, which relates to '{CONCEPT}':
+#
+# {INSTRUCTION}
+#
+# Your task is to:
+#
+# 1. Rewrite the instruction with the minimum changes necessary so that it relates to '{CONTRAST_CONCEPT}' instead of '{CONCEPT}'.
+# 2. Keep as much of the original wording and structure as possible -- only change what is required to remove '{CONCEPT}' and add '{CONTRAST_CONCEPT}'.
+# 3. Ensure the rewritten instruction logically incorporates '{CONTRAST_CONCEPT}'.
+#
+# **Formatting Guidelines:**
+#
+# - Return only the rewritten instruction.
+# - Write the final content (or appropriate format for the genre) in plain text.
+# - Do not include any additional text, explanations, or formatting.
+#
+# **Final Answer:** Return only the final content, following the guidelines above."""
 T_INSTRUCTION_WITH_RELATED_CONCEPT = """Given the following instruction, which relates to '{CONCEPT}':
 
 {INSTRUCTION}
@@ -293,7 +362,7 @@ T_INSTRUCTION_WITH_RELATED_CONCEPT = """Given the following instruction, which r
 Your task is to:
 
 1. Rewrite the instruction with the minimum changes necessary so that it relates to '{CONTRAST_CONCEPT}' instead of '{CONCEPT}'.
-2. Keep as much of the original wording and structure as possible -- only change what is required to shift the concept.
+2. Keep as much of the original instruction's length, wording, and structure as possible -- only change what is required to shift the concept.
 3. Ensure the rewritten instruction logically incorporates '{CONTRAST_CONCEPT}'.
 
 **Formatting Guidelines:**

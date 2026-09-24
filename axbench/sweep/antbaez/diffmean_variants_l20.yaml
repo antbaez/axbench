@@ -31,7 +31,14 @@ train:
       n_epochs: 1
       binarize_dataset: true
       low_rank_dimension: 1
-    DiffMeanPositional:
+    # DiffMeanPositional:
+    #   batch_size: 24
+    #   n_epochs: 1
+    #   binarize_dataset: true
+    #   low_rank_dimension: 1
+    #   num_positions: 64
+    # each position scaled by its coverage r_k (see CLAUDE.md sec. 3)
+    DiffMeanPositionalWeighted:
       batch_size: 24
       n_epochs: 1
       binarize_dataset: true
@@ -39,7 +46,7 @@ train:
       num_positions: 64
 inference:
   use_bf16: true
-  models: ["MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositional"]
+  models: ["MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositionalWeighted"]
   model_name: "google/gemma-2-9b-it"
   # latent related params
   output_length: 128
@@ -50,11 +57,18 @@ inference:
   steering_model_name: "google/gemma-2-9b-it"
   steering_datasets: ["ContrastInstructions"]
   steering_batch_size: 140
-  steering_output_length: 128
+  steering_output_length: 512 # final run should be 512
   steering_layers: [20]
   steering_num_of_examples: 10 # number of examples per concept and per factor
+  # which seed_instructions split ContrastInstructions builds steering prompts from.
+  # "train" (default) reuses the pool the training examples came from; "test" uses the held-out pool
+  steering_instructions_dist: "train"
+  # 1 = inject the random contrast concept directly, one prompt; 2 (old default) =
+  # inject the target concept first, then minimally edit toward the contrast concept
+  random_concept_injection_n_steps: 1
+  capture_norms: false #record per-token layer-20 residual norms
   # steering_factors: [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] # number of steering factors per example
-  steering_factors: [0.25, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+  steering_factors: [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
 
   # master data dir is shared across all jobs.
   master_data_dir: "axbench/data"
@@ -64,7 +78,7 @@ inference:
   # generation related params
   temperature: 1.0
 evaluate:
-  models: ["MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositional"]
+  models: ["MeanTokenDiffMean", "LastTokenDiffMean", "DiffMeanPositionalWeighted"]
   latent_evaluators: [
     "AUCROCEvaluator",
     "HardNegativeEvaluator",

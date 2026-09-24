@@ -33,6 +33,12 @@ class DatasetArgs:
     # text-genre concepts are taken first, before random text concepts fill up to
     # max_concepts. None = random selection only.
     seed_concepts_dir: Optional[str] = None
+    # generate.py --mode training: a concept16k split's generate/ dir, whose already
+    # genre-labeled text concepts (excluding anything already taken from
+    # seed_concepts_dir) fill any shortfall below max_concepts, sampled with a fixed
+    # seed (42) rather than the run's own --seed. None = fall back to classifying the
+    # random pool via an LLM call, as before.
+    concept16k_dir: Optional[str] = None
     model_name: Optional[str] = None
     steering_model_name: Optional[str] = None
     n_steering_factors: Optional[int] = None
@@ -44,6 +50,24 @@ class DatasetArgs:
     steering_batch_size: Optional[int] = None
     steering_output_length: Optional[int] = None
     steering_num_of_examples: Optional[int] = None
+    # which raw instruction pool ContrastInstructions builds steering prompts from:
+    # "train" = the same pool the training examples were built from (default, and what
+    # every run before this flag did), "test" = the held-out Dolly pool, so steering
+    # prompts are instructions no method was fit on, "alpaca" = tatsu-lab/alpaca_eval's
+    # instructions (axbench/data/alpaca_eval.json) instead of the Dolly-derived pool.
+    # Read from the inference section only.
+    steering_instructions_dist: Optional[str] = "train"
+    # ContrastInstructions' steering-prompt construction: 1 = inject the (random,
+    # held-out) contrast concept directly into the base instruction in one LLM call,
+    # reusing T_INSTRUCTION_WITH_CONCEPT's wording; 2 (default, and what every run
+    # before this flag did) = the original two-step edit, inject the target concept
+    # first, then minimally edit that toward the contrast concept via
+    # T_INSTRUCTION_WITH_RELATED_CONCEPT. Read from the inference section only.
+    random_concept_injection_n_steps: Optional[int] = 2
+    # inference.py --mode steering: record the per-token residual norm at the steering
+    # layer, before and after the intervention, for every row of the run, into
+    # inference/norms/. Read from the inference section only.
+    capture_norms: Optional[bool] = False
     steering_intervention_type: Optional[str] = None
     lm_model: Optional[str] = None
     run_name: Optional[str] = None

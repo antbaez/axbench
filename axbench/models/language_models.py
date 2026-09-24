@@ -160,6 +160,11 @@ class LanguageModel(object):
             raise ValueError(f"{model} model class is not supported yet.")
         self.stats = LanguageModelStats(model)
         self.client = client
+        # dump dir
+        if dump_dir:
+            cur_save_dir = Path(dump_dir) / "lm_cache"
+            cur_save_dir.mkdir(parents=True, exist_ok=True)
+            self.dump_dir = cur_save_dir
         self.temperature = kwargs.get("temperature", 1.0)
         self.cache_dir = None
         self.use_cache = use_cache
@@ -231,11 +236,17 @@ class LanguageModel(object):
                 # running out of credit is also a 429, but waiting won't fix it
                 if attempt == self.rate_limit_retries or getattr(e, "code", None) == "insufficient_quota":
                     raise
+                reason = "Rate limited"
+            except openai.APITimeoutError:
+                # the client (max_retries) already retried internally before this surfaced
+                if attempt == self.rate_limit_retries:
+                    raise
+                reason = "Request timed out"
             finally:
                 if self.request_limiter is not None:
                     self.request_limiter.release()
             delay = min(60, 2 ** attempt) * random.uniform(1, 1.5)
-            logger.warning(f"Rate limited; retrying in {delay:.1f}s "
+            logger.warning(f"{reason}; retrying in {delay:.1f}s "
                            f"(attempt {attempt + 1}/{self.rate_limit_retries}).")
             await asyncio.sleep(delay)
 
@@ -264,6 +275,13 @@ class LanguageModel(object):
                     prompt=batch_prompts[j], completion=completion)
 
         return all_completions
+
+    def dump(self):
+        with open(self.dump_dir / "tmp_prompt_cache.json", "w") as outfile:
+            json.dump(self.stats.prompt_cache, outfile, indent=4)
+
+        with open(self.dump_dir / "cost.jsonl", 'a') as f:
+            f.write(json.dumps({"price": self.stats.get_total_price()}) + '\n')
 
     def save_cache(self):
         if self.use_cache:

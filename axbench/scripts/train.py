@@ -3,6 +3,10 @@
 #
 # example launch command:
 #     torchrun --nproc_per_node=NUM_GPUS axbench/scripts/train.py --config axbench/demo/sweep/train.yaml
+import warnings
+warnings.filterwarnings("ignore", message=r"pyreft not installed.*")
+warnings.filterwarnings("ignore", message=r"HyperSteer unavailable.*")
+
 import os
 import argparse
 import yaml

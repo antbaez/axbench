@@ -6,6 +6,10 @@
 # example launch command:
 #     python axbench/scripts/evaluate_local.py --config axbench/demo/sweep/evaluate.yaml --mode steering
 
+import warnings
+warnings.filterwarnings("ignore", message=r"pyreft not installed.*")
+warnings.filterwarnings("ignore", message=r"HyperSteer unavailable.*")
+
 import shutil
 import itertools
 from axbench.models.local_judge import LocalLanguageModel
@@ -22,6 +26,7 @@ import numpy as np
 import datetime
 import yaml
 from axbench.scripts.inference import LATENT_EXCLUDE_MODELS, STEERING_EXCLUDE_MODELS
+from axbench.scripts.build_preview_ratings import build_previews
 import axbench
 from axbench.utils.plot_utils import (
     plot_aggregated_roc,
@@ -651,6 +656,11 @@ def eval_steering(args):
             f"{output_tag}_data.parquet."
         )
         maybe_auto_merge_chunks(args)
+        # Rebuild the ratings preview after every chunk (cheap -- it only covers the
+        # first 10 concepts' debug dump), so it fills in as soon as the chunk(s)
+        # covering those concepts finish, rather than only at the very end.
+        for path in build_previews(dump_dir, args.data_dir):
+            logger.warning(f"Wrote {path}")
         return
     # Reload for plotting and optional winrate
 
@@ -675,6 +685,9 @@ def eval_steering(args):
     plot_steering(aggregated_results, dump_dir, args.report_to, args.wandb_name, args.mode)
     plot_metrics_multiple_datasets(os.path.join(dump_dir, "steering_data.parquet"), dump_dir, args.report_to, args.wandb_name, args.mode, rule = args.steer_data_type=="rule")
     #plot_metrics_multiple_datasets(os.path.join(dump_dir, "steering_data.parquet"), dump_dir, args.report_to, args.wandb_name, args.mode, rule = args.steer_data_type=="rule")
+
+    for path in build_previews(dump_dir, args.data_dir):
+        logger.warning(f"Wrote {path}")
     logger.warning("Evaluation completed!")
 
 

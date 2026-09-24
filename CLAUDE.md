@@ -22,7 +22,14 @@ with `generate:` / `train:` / `inference:` / `evaluate:` blocks. `generate.py` a
 `inference.py` run under `torchrun`.
 
 1. **`generate.py`** — synthesize training/eval data per concept (skip if reusing
-   pre-generated data, see concept500 below).
+   pre-generated data, see concept500 below). How the positive/negative pairs and
+   contrast pools are built, and what the rewrite wording does to them, is in §7c.
+   Every gpt-4o-mini prompt and completion is logged at exit (`reset_stats` →
+   `LanguageModel.dump()`) to `generate/lm_cache/tmp_prompt_cache.json`, keyed by call
+   type (`.instruction_with_concept`, `.instruction_with_related_concept`,
+   `.get_contrastive_concepts`, `.get_more_contrastive_concepts`, …), plus
+   `lm_cache/cost.jsonl`. That log is the only record of the exact wording a dump was
+   built with (~85 MB for 500 concepts); it was briefly removed and restored.
 
 2. **`train.py`** — fits every configured method (`DiffMean`, PCA, LAT, probes,
    the `mean.py` variants, etc.) independently per concept. Concepts (not model
@@ -128,10 +135,11 @@ with `generate:` / `train:` / `inference:` / `evaluate:` blocks. `generate.py` a
    requests via vLLM instead of a process pool of API clients). The same
    "`get_best_factors` exists but isn't wired into `steering_test`" caveat above
    applies here too — it re-judges whichever factors are present in its data
-   slice, it doesn't filter to a previously-selected best factor. The 500
-   concepts are split into 5 fixed, deterministic chunks via the same
+   slice, it doesn't filter to a previously-selected best factor. The
+   concepts are split into `NUM_CHUNKS` (4 in `run_preemptable.sh`) fixed, deterministic
+   chunks via the same
    `chunk_bounds()` logic `inference.py` uses (so both stages shard identically);
-   `run_preemptable_evaluate_local.sh` self-resubmits one Slurm job per chunk with
+   `run_jobs/run_preemptable_evaluate_local.sh` self-resubmits one Slurm job per chunk with
    `--requeue`, and per-concept state pickles let a preempted chunk resume rather
    than restart. The last chunk to finish auto-merges all `{mode}_chunk*` files into
    the canonical `{mode}.jsonl`/`{mode}_data.parquet` (`--merge_chunks` does the same
@@ -159,6 +167,27 @@ with `generate:` / `train:` / `inference:` / `evaluate:` blocks. `generate.py` a
    ratings) under `{dump}/evaluate/`, then prints a factor × model table and each
    method's best factor. Needs no GPU — `evaluate.py` loads no local model when
    `LMJudgeEvaluator` is the only steering evaluator.
+
+6c. **`evaluate_subset.py --mode select_best`** — the OpenAI-judge (gpt-4o-mini,
+   temperature 0) script that actually does "pick the factor on eval, score it on
+   test". Phase 1 judges `--factors` on the `steering` split, takes each (concept,
+   model)'s argmax factor, and phase 2 judges only that factor on `steering_test`.
+   With the yaml's `winrate_split_ratio: 0.5` and 10 prompts per concept, the split is
+   `input_id` 0–4 (eval) vs 5–9 (held-out), so each held-out cell is 5 prompts.
+   Args: `--factors "1.0,…"` or `all`, `--examples_per_concept`, `--max_concepts`
+   (first N concept ids), `--num_workers` (threads). Reads
+   `inference/steering_data.parquet`; writes `select_best_summary.json`,
+   `steering[_test]_subset.json`, `steering[_test]_ratings.jsonl` (one line per judged
+   generation, with `input_id`) and a preview under `{dump}/evaluate/`. Needs
+   `OPENAI_API_KEY` (`set -a; source .env; set +a`) and no GPU; ~$6 per 200 concepts ×
+   3 models at 128 generated tokens, ~4× that at 512. Ties in the argmax go to the
+   **smallest** factor (`list.index(max)`): a concept rated 0 at every factor "selects"
+   the lowest one. The factor histogram marks these (`[k tie-broken]`, plus a per-model
+   row splitting never-steered from tied-at-a-positive-rating) and
+   `select_best_summary.json` records them under `best_factor_ties`. In practice 30–50%
+   of (concept, model) picks are ties — 5 prompts × a 0/1/2 judge — so per-concept
+   factor choice is noisy, and the "most concepts pick 0.25" histograms were almost
+   entirely ties.
 
 7. **`axbench/scripts/analyses.ipynb`** — turns evaluation output into the
    paper/leaderboard-style numbers.
@@ -188,6 +217,23 @@ deliberately left untouched so its published numbers stay reproducible.
 | `MeanTokenDiffMean` | 1 | every real token (`DiffMean`'s behavior, explicitly named) | `PromptAdditionIntervention` |
 | `LastTokenDiffMean` | 1 | each sequence's final real token only | `PromptAdditionIntervention` (inherited) |
 | `DiffMeanPositional` | `num_positions` | the token at each offset *k* back from the sequence end | `PositionwisePromptAdditionIntervention` |
+| `DiffMeanPositionalWeighted` | `num_positions` | as `DiffMeanPositional`, each unit vector then scaled by its coverage `r_k` | `PositionwisePromptAdditionIntervention` (inherited) |
+
+**`DiffMeanPositionalWeighted`.** `r_k` is the share of a concept's training rows
+(positives and negatives together) with a real token at slot *k* — not left-padding and
+past the chat-template prefix (`_real_token_mask`); the trailing generation header counts
+as real, since it attends to the content. The saved positional vectors are `r_k · v_k`,
+**not** renormalized, so steering at slot *k* is `r_k × factor × max_act`; the collapsed
+latent direction is `normalize(mean_k r_k · v_k)`, so `max_act` comes from a
+coverage-weighted direction in the usual units. `r_k` is saved under `real_frac`. It exists
+because at `num_positions: 64` most concepts' deep slots are reached by only a few long
+examples (most of the unmasked mean is padding there), yet `DiffMeanPositional` gives
+those vectors the same unit norm and the same weight in the collapsed direction. The
+subclass only overrides two hooks (`_scale_positions`, `_extra_checkpoint_tensors`), so
+`DiffMeanPositional`'s weights are unchanged. It is now one of the three models in the
+working yaml, `axbench/sweep/antbaez/diffmean_variants_l20.yaml` (with
+`MeanTokenDiffMean` and `LastTokenDiffMean`); `diffmean_variants_l20_alpaca.yaml` is the
+same file with `steering_instructions_dist: "alpaca"`.
 
 The last column is each class's own `make_model()` override, not the yaml's
 `steering_intervention_type` — all three hardcode a prefill-only intervention so none
@@ -245,6 +291,19 @@ acknowledged tradeoff, not an oversight: deep positions (large `k`, few long-eno
 examples) are the most exposed, since a bigger share of their contributions there are
 non-content. Revisit if deep-position vectors look degenerate or steering quality
 drops off sharply with `k`.
+
+**Consequence observed in practice: sensitivity to positive/negative length
+asymmetry.** Because padding and prefix are not masked, if negatives are
+systematically longer than positives, then at slots ~16–64 from the end more negatives
+than positives have real content there, and those slots' diff-of-means picks up a
+"content vs padding/prefix" component unrelated to the concept. `MeanTokenDiffMean`
+(real tokens only) and `LastTokenDiffMean` (always-aligned final token) are immune.
+The v6 data (negatives +3.0 tokens on average) showed exactly this signature:
+`DiffMeanPositionalWeighted`'s latent activations shifted up by ~30 on positives *and*
+negatives alike (a common-mode offset, not separation), its `max_act` rose 45%, and its
+concept relevance fell the most of the three. Keep pair lengths matched in the
+training data (§7c) rather than relying on the method to cope. Masking padding per slot
+remains the untested alternative.
 
 **Other implementation notes:**
 - *Latent mode:* the positional matrix is collapsed to a mean-across-positions
@@ -312,21 +371,21 @@ uv run axbench/scripts/evaluate.py --config $CFG --dump_dir $DUMP --mode steerin
 `torchrun --nproc_per_node=$gpu_count` wraps `train.py`/`inference.py` only —
 `generate.py` and `evaluate.py` run as plain `uv run` scripts.
 
-**On Slurm, use the `run_preemptable_*.sh` wrappers instead of the raw commands
+**On Slurm, use the `run_jobs/run_preemptable_*.sh` wrappers instead of the raw commands
 above.** `run_preemptable.sh` holds `CFG`/`DUMP`/`NPROC`/`NUM_CHUNKS` and a
 commented-out line per stage; uncomment one stage at a time, since ordering *between*
 stages is still manual. Each stage script runs **both** of its modes from a single
 call:
 
-- `run_preemptable_generate.sh <CFG> <DUMP> <NUM_WORKERS> <MAX_CONCURRENT>` — training
+- `run_jobs/run_preemptable_generate.sh <CFG> <DUMP> <NUM_WORKERS> <MAX_CONCURRENT>` — training
   then latent, **locally in the calling shell, no sbatch**, ordered by `set -e`. These
   modes never touch the GPU (`generate.py` only moves a model to CUDA in
   `--mode dpo_training`), so they need no allocation.
-- `run_preemptable_inference.sh <CFG> <DUMP> <NPROC> <NUM_CHUNKS>` — submits N latent
+- `run_jobs/run_preemptable_inference.sh <CFG> <DUMP> <NPROC> <NUM_CHUNKS>` — submits N latent
   chunk jobs, then N steering chunk jobs carrying `--dependency=afterok` on *every*
   latent job, so no steering chunk starts until the whole latent set has succeeded and
   merged. Each steering worker also runs `--mode latent --verify_chunks` first.
-- `run_preemptable_evaluate_local.sh <CFG> <DUMP> <NUM_CHUNKS>` — same shape for the
+- `run_jobs/run_preemptable_evaluate_local.sh <CFG> <DUMP> <NUM_CHUNKS>` — same shape for the
   local judge: N `steering` chunks, then N `steering_test` chunks chained behind them.
   Here the chaining is *not* a data dependency (the two modes are independent); it
   just serialises GPU demand.
@@ -337,6 +396,34 @@ The chaining works by capturing ids from `sbatch --parsable` and passing them as
 failure leaves them unsatisfiable, and this cluster's `kill_invalid_depend` cancels
 them rather than leaving them pending forever. A pending job showing `(BeginTime)` is
 just post-preemption backoff, not a problem.
+
+Operational notes learned the hard way:
+
+- **Time limit is 12 h** (`#SBATCH --time=12:00:00` in all three `run_jobs/` scripts;
+  `mit_preemptable` allows 2 days). At 512 generated tokens a 125-concept steering
+  chunk takes ~3–4 h and one hit the old 4 h limit; at 128 tokens a chunk takes ~43 min.
+  `--requeue` only covers preemption — a **TIMEOUT is not requeued**. Resubmit the one
+  chunk by hand (`sbatch run_jobs/run_preemptable_inference.sh <CFG> <DUMP> 1 4 steering
+  <k>`); its state pickle makes it resume where it stopped.
+- **sbatch copies the submitting shell's environment into the job.** Steering builds
+  its `ContrastInstructions` prompts with gpt-4o-mini, so a chunk submitted from a shell
+  without `.env` loaded dies within a minute with `OpenAIError: Missing credentials`.
+  `run_preemptable.sh` loads `.env` itself; for hand resubmits use
+  `cd ~/axbench && set -a && source .env && set +a && sbatch ...`.
+- **`evaluate_local.py` chunks that start in the same second can kill each other.**
+  `stanza.Pipeline(...)` runs at import (`evaluate_local.py:43`) and rewrites
+  `~/.cache/stanza/.../resources.json` on the shared NFS home — in the parent *and* again
+  in vLLM's spawned EngineCore — so concurrent starts race and one gets
+  `OSError: [Errno 116] Stale file handle` → `Engine core initialization failed`. With
+  the `afterok` chain that cancels all `steering_test` chunks. Resubmitting is safe; the
+  proposed fix (`download_method=None` there) has not been applied. Stanza is only needed
+  by the rule-based evaluators, not `LMJudgeEvaluator`.
+- **Use `uv run --no-sync` whenever jobs are running.** A plain `uv run` re-syncs the
+  shared `.venv` and has rebuilt it under running jobs. `run_jobs/run_preemptable_generate.sh`
+  still calls plain `uv run`.
+- **Importing `axbench` on the login node is slow** (torch/transformers/pyvene) and has
+  timed out; for quick data checks read parquets with pyarrow and tokenize with
+  `tokenizers.Tokenizer.from_file(<HF cache>/tokenizer.json)` instead.
 
 ### 5. Using pre-generated `concept500` data (skip data generation)
 
@@ -368,10 +455,13 @@ yamls under `axbench/sweep/wuzhengx/<size>/<layer>/`.
   in git"), not gitignored, not fetched by a download script — no regeneration or
   download step is needed to match the benchmark's exact data.
 - **Verified from code:** re-running `generate.py` would *not* reproduce this exact
-  dataset. Concept *selection* is seeded and deterministic (`generate_training()` in
-  `axbench/scripts/generate.py` does `set_seed(args.seed)` then a shuffle, taking
-  the first `max_concepts`) — same seed/config gives the same 500 concepts, same
-  order. But the LLM-*synthesized example text* is not deterministic:
+  dataset. Concept *selection* is seeded (`set_seed(args.seed)` then a shuffle), but it
+  also runs an LLM genre classification (`n_genre_classified` in
+  `selected_concepts.json`), so it is only *nearly* deterministic: two reruns with seed
+  42 shared 497/500 concepts but only ~400 at the same `concept_id`. Match concepts
+  across dumps by concept string, never by id. The base-instruction pools *are*
+  reproduced exactly (seeded `random.sample`: v6 and v8 have identical 72/72 pools). The
+  LLM-*synthesized example text* is not deterministic:
   `axbench/models/language_models.py:113` defaults `temperature` to `1.0`, and the
   `chat.completions.create` call at `language_models.py:148-149` passes no `seed=`
   parameter. So a fresh `generate.py` run reproduces the same 500 concepts but
@@ -391,8 +481,8 @@ Distinct from `16k_diffmean.yaml` / `16k_diffmean_crossfit.yaml` (under `9b/l20`
 not the steering leaderboard.
 
 **Unverified / inferred, flagged explicitly:** it is *believed but not confirmed*
-that `no_grad.yaml` is what produced the `DiffMean` row in the top-level
-`README.md` leaderboard table (`0.297 | 0.178 | 0.322 | 0.158 | 0.239` for
+that `no_grad.yaml` is what produced the `DiffMean` row in the
+`markdown_files/README.md` leaderboard table (`0.297 | 0.178 | 0.322 | 0.158 | 0.239` for
 2B L10 / 2B L20 / 9B L20 / 9B L31 / Avg). Those exact numbers appear nowhere else in
 the repo — no results file, log, or notebook output ties them to a specific run.
 The inference rests on circumstantial evidence: `no_grad.yaml`'s four splits match
@@ -401,6 +491,109 @@ the table's four columns exactly, it's the only `DiffMean` config that uses
 `prod_*_concept500_no_grad`. To actually confirm this, run `no_grad.yaml`
 end-to-end per section 4/5 above and compare the `evaluate.py --mode steering_test`
 output to the table.
+
+### 7b. Steering prompt instructions: train vs held-out (`steering_instructions_dist`)
+
+`generate.py --mode training` samples one pool of `num_base_instructions` instructions
+from `seed_instructions["text_train"]` into `generate/base_instructions.json`, and
+*every* stage reuses it: training examples, latent eval data, and the
+`ContrastInstructions` steering prompts (each a rewrite of a pool instruction carrying a
+held-out contrast concept). So by default the concept side of a steering prompt is held
+out but the instruction side is not — the direction was fit on those same instructions.
+
+`steering_instructions_dist` in the **`inference:`** block selects which pool steering
+draws from: `"train"` (default, the historical behavior); `"test"`, which reads
+`generate/base_instructions_test.json`, sampled the same way from `text_test` (1000
+instructions available, disjoint from `text_train`); or `"alpaca"`, which reads
+AlpacaEval's instructions straight from `axbench/data/alpaca_eval.json` (no dump-local
+pool; needs `master_data_dir`; cache suffix `_alpaca`). `generate.py --mode training`
+writes the train and test pools unconditionally — no API calls, so flipping the flag
+later never requires regenerating and the pools cannot drift.
+
+**`random_concept_injection_n_steps`** (also `inference:`, default 2) sets how each
+steering prompt gets its held-out contrast concept:
+- `2` — the training-negative recipe: inject the *target* concept into the instruction,
+  then rewrite that toward the contrast concept with `T_INSTRUCTION_WITH_RELATED_CONCEPT`.
+  The rewrite leaves traces of the target concept: the judge found the target concept
+  already present in **29%** of v5's held-out steering prompts, which inflates every
+  method's concept relevance independent of steering.
+- `1` — inject the contrast concept directly into the bare instruction (one call, reusing
+  `T_INSTRUCTION_WITH_CONCEPT`); the target concept never enters the prompt (~4% judged
+  present, the detector's false-positive floor). Use this for honest numbers.
+
+Held-out contrast concepts come from *other* concepts' pools, excluding every string in
+the target's own pool (checked: 0% overlap), so a steering prompt never uses a contrast
+its direction was trained against.
+
+- Steering prompts are cached **per distribution**
+  (`steering_eval_data[_test].parquet`, `steering_eval_cache[_test]/`), since a cached
+  prompt records nothing about which pool built it; the rows also carry an
+  `instructions_dist` column. Switching the flag therefore costs one fresh round of
+  prompt generation (~2 gpt-4o-mini calls per concept) rather than silently reusing the
+  other pool's prompts.
+- Training data and latent eval data still use the train pool either way, so
+  checkpoints and `max_act` stay comparable across the flag.
+- The field lives on `DatasetArgs`, which is shared by all three sections, so the key is
+  also *accepted* (and ignored) under `generate:`/`evaluate:` — steering reads it from
+  the inference section only.
+- Expect every method's absolute score to drop somewhat under `"test"`; comparisons
+  between methods stay fair, but `"test"` numbers are not comparable with `"train"` ones.
+- **Backfilling a dump generated before this flag existed** (no test pool on disk):
+
+  ```python
+  # uv run --no-sync python - <<'PY'
+  from datasets import load_from_disk
+  from axbench.utils.dataset import load_or_create_base_instructions
+  seed = load_from_disk("axbench/data/seed_instructions")
+  load_or_create_base_instructions("<dump>/generate", seed, 72, dist="test")
+  PY
+  ```
+
+  It only samples (`random.sample`, no seeding of its own), so the pool it writes is not
+  the one a rerun of `generate.py` would have produced — fine for an eval-only pool, but
+  record it if you care about exact reproducibility.
+
+### 7c. Training pairs, contrast pools, and the rewrite wording
+
+`generate.py --mode training` makes 144 rows per concept: 72 **positives** (a
+base-pool instruction with the concept woven in, `T_INSTRUCTION_WITH_CONCEPT`, which
+tells the model to *avoid copying the concept's words*) and 72 **negatives**, each a
+rewrite of its own positive toward one contrast concept (`T_INSTRUCTION_WITH_RELATED_CONCEPT`,
+via `instruction_with_related_concept`). Output is empty — the dataset is prompts only.
+Rows are paired by order within a concept. The latent eval set (72 per concept) is built
+the same way.
+
+**Contrast pools** (`generate/contrastive_concepts.json`, keyed by concept string):
+`get_contrastive_concepts` makes **two calls of 36** — `T_GENERATE_CONTRASTIVE_CONCEPTS`,
+then `T_GENERATE_MORE_CONTRASTIVE_CONCEPTS` shown the first 36 — and merges them with
+de-duplication (case and surrounding quotes ignored), so up to 72 = one per negative.
+`assign_contrast_concepts` walks a reshuffled pool, cycling only if it is short. History:
+v5 used 10 per concept, v6 30; a single call for 72 came back anywhere from 1 to 123 items
+(one concept as a single comma-separated line, a third of entries wrapped in quotes),
+which is why it is now two calls.
+
+**The rewrite wording drives the pair statistics** — measured across four generations:
+
+| | v5 ("…only change what is required to shift the concept") | v6 ("…to remove X and add Y") | v8-old ("completely replace X with Y … in place") | v8 (v5 + "length") |
+|---|---|---|---|---|
+| positive − negative length (tokens) | −1.65 | −3.00 | −5.21 | −1.68 |
+| negatives longer | 57% | 66% | 76% | 57% |
+| concepts with mean gap > 3 tokens | 13% | 40% | 75% | 11% |
+| negatives pasting the contrast concept string verbatim | 31% | 56% | 73% | 26% |
+| negatives echoing the task prompt | 2.4% | 4.5% | 7.7% | 2.5% |
+| target-concept keywords left in negatives (chance ≈7%) | 19% | 21% | 24% | 21% |
+
+The more literally the wording frames the task as swapping *concept names*, the more the
+model pastes the contrast concept's description verbatim (it cannot find the target to
+replace, because the positive paraphrased it) — making negatives longer and stylistically
+unlike positives. That length asymmetry is what hurts `DiffMeanPositional*` (§3). The
+current template is v5's wording plus "length" in item 2; the v6 and v8-old wordings are
+kept commented above it in `prompt_templates.py`. No wording tried so far reduces the
+~20% of negatives that keep target-concept keywords.
+
+Measure a new generation before training on it: `~/axbench_runner/compare_generations.py`
+(outside the repo) prints all of the above plus pool sizes, duplicate rates, per-slot
+padding imbalance and cross-run overlap for any set of dumps.
 
 ### 8. Silent-failure traps in this repo
 
@@ -437,6 +630,27 @@ Each of these fails quietly — wrong results or ignored settings, no error:
   `mean`, so a symbol in `mean.py` sharing a name with one in `probe.py` silently
   wins in the `axbench` namespace. Name new helpers distinctly (e.g.
   `LeftPadDataCollator`, not `DataCollator`).
+- **Template changes don't reach an existing dump.** Contrast pools are only generated
+  for concepts missing from `generate/contrastive_concepts.json`
+  (`load_or_create_contrastive_concepts_batch`), and steering prompts are reused from
+  `inference/steering_eval_data[_test|_alpaca].parquet` / `steering_eval_cache*/`.
+  Generate into a fresh dump, or delete those files, after editing a template.
+- **Many concepts steer at an arbitrary strength.** A non-positive `max_act` is replaced
+  by 50; in these runs that is 22–42% of concepts for `MeanTokenDiffMean` and
+  `LastTokenDiffMean` (3–10% for the positional method), so their factor sweep is not
+  calibrated to the data for those concepts.
+- **Short generations cap fluency.** At `steering_output_length: 128`, ~80% of
+  generations are cut mid-sentence and the judge scores fluency ~1.1–1.2 at *every*
+  factor (vs ~1.5 at 512), compressing all scores. The cut also hides concepts that
+  surface late: the first concept mention is at a median ~30 tokens for MeanToken/
+  Positional but ~70 for LastToken (30% after token 128), so short outputs understate
+  LastToken most.
+- **Removing a concept means renumbering.** `train.py` indexes `metadata[concept_id]` by
+  list position, so a gap misaligns every later concept. Drop the concept from
+  `metadata.jsonl`, `train_data.parquet`/`.json`, `latent_eval_data.parquet`,
+  `contrastive_concepts.json`, `selected_concepts.json` and both state pickles, shifting
+  later ids down (`~/axbench_runner/remove_concept.py` does this with a backup; used to
+  drop v8's "names of people, places, or organizations").
 
 ### 9. Verified internals (checked against pinned source)
 
@@ -480,3 +694,35 @@ once and applied to **every** model in the run — it is not a per-method settin
 name and file: it averages per-example first and then across examples (equal weight
 per example), whereas `DiffMean` pools all tokens (equal weight per token). Don't
 assume they're comparable.
+
+### 10. Experiment log (9B / L20, own `pos_steer_data`, `axbench/results/prod_9b_l20_concept500_diffmean_pos_steer_data*`)
+
+Held-out scores below are `evaluate_subset.py --mode select_best`, gpt-4o-mini, first 200
+concepts, 5 eval + 5 held-out prompts each. Pos = `DiffMeanPositionalWeighted`.
+
+| Dump | Data | Steering prompts | Tokens | Mean / Last / Pos | Pos − Mean |
+|---|---|---|---|---|---|
+| `_v5` | 332 concepts, pool 10, "shift" wording | 2-step, test pool | 512 | 0.458 / 0.330 / **0.516** | **+0.058** [+0.02, +0.10] |
+| `_v6` | 500 concepts, pool 30, "remove and add" | 1-step, test pool | 512 | 0.325 / 0.229 / 0.306 | −0.019 [−0.06, +0.02] |
+| v7a (main dump, `evaluate_old`) | v6's exact data and weights | 1-step, train pool | 128 | 0.225 / 0.116 / 0.210 | −0.015 |
+| v7b (main dump) | v6's exact data and weights | 2-step, train pool | 128 | pending | |
+| `_v8` | 499 concepts, pool ~72 (one call), v5 wording + "length" | — | — | training | |
+
+What has been established:
+- **The v5 → v6 drop in absolute score is prompt leakage.** Removing held-out prompts the
+  judge rates as already containing the concept (Option A, `~/axbench_runner/adjust_leak.py`)
+  brings v5 to 0.313 / 0.159 / 0.359 — v6's level. Almost all of the change is in concept
+  relevance.
+- **Positional's lost lead is not leakage, output length, instruction pool, factor grid
+  or noise in v6** (leak-filtered v5 still +0.045; v7a reproduces v6's tie with a
+  different pool, length and grid). The best-supported cause is the length asymmetry in
+  v6's training pairs (§3, §7c), which the v8 data removes. v7b tests the remaining
+  alternative (2-step prompts matching how negatives are built).
+- The local Llama-70B judge (`evaluate_local.py`) scores much higher in absolute terms
+  (e.g. v5-era Run A: 0.775 / 0.553 / 0.741 for Pos / Last / Mean) — never compare its
+  numbers with gpt-4o-mini's.
+
+Analysis scripts from these sessions live outside the repo in `~/axbench_runner/`:
+`analyze.py` (eval-best → test for an `evaluate_local` dump), `adjust_leak.py` +
+`leak_judge.py` (prompt-leak filter), `compare_generations.py`, `compare_scores.py`,
+`concept_position.py`, `data_change_checks.py`, `remove_concept.py`.

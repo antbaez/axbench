@@ -15,6 +15,8 @@ give it. What changes is which rows are judged and how results are written.
     --examples_per_concept N     keep the first N input_ids per concept/split.
     --max_concepts N             stop after N concepts.
     --num_workers N              threads issuing judge calls in parallel.
+    --eval_models "A,B"          steering methods to judge. Default: all of the
+                                 yaml's evaluate.models.
 
 select_best runs --factors against the steering (eval) split, picks each
 (concept, model)'s own best-scoring factor from that (mirroring
@@ -47,7 +49,7 @@ Whole-number-factors example, first 250 concepts, gpt-4o-mini judge:
 Needs no GPU -- evaluate.py loads no local model when LMJudgeEvaluator is the
 only steering evaluator, so this runs fine in a plain CPU allocation.
 """
-import os, sys, json, asyncio, logging, threading
+import os, sys, json, math, asyncio, logging, threading, warnings
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -57,10 +59,14 @@ import pandas as pd
 from openai import AsyncOpenAI
 from tqdm.auto import tqdm
 
+warnings.filterwarnings("ignore", message=r"pyreft not installed.*")
+warnings.filterwarnings("ignore", message=r"HyperSteer unavailable.*")
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 import axbench
 from axbench.models.language_models import LanguageModel
 from axbench.scripts.args.eval_args import EvalArgs
+from axbench.scripts.build_preview_ratings import build_previews
 
 logging.basicConfig(
     format='%(asctime)s,%(msecs)03d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
@@ -82,7 +88,7 @@ def make_lm_model(lm_model_name, dump_dir):
     lm_model = LanguageModel(
         lm_model_name, client, dump_dir=dump_dir, use_cache=True,
         cache_level="prompt", cache_tag="evaluate_subset",
-        master_data_dir="axbench/data", temperature=0.0)
+        master_data_dir="axbench/data", temperature=0.0, rate_limit_retries=8)
     return client, lm_model
 
 
@@ -287,20 +293,31 @@ def print_single_mode_report(summary, models, factors):
     print()
 
 
-def print_select_best_report(summary_eval, summary_test, best_factor, models, factors):
+def print_select_best_report(summary_eval, summary_test, best_factor, models, factors,
+                             best_ties=None):
+    best_ties = best_ties or {}
     print_factor_table(
         summary_eval, models, factors,
         "PHASE 1: STEERING (eval split) -- MEAN LM JUDGE RATING BY FACTOR")
 
     print("\n" + "-" * 58)
     print("FACTOR SELECTED PER CONCEPT (how often each candidate factor won)")
+    print("[k tie-broken] = won only because ties go to the smallest tied factor")
     print("-" * 58)
     for m in models:
-        chosen = [f for (c, mm), f in best_factor.items() if mm == m]
+        chosen = [(c, f) for (c, mm), f in best_factor.items() if mm == m]
         for f in factors:
-            n = sum(1 for x in chosen if x == f)
-            if n:
-                print(f"  {m:<22} factor {f:>5}: {n:>4} concepts ({100 * n / len(chosen):.1f}%)")
+            won = [c for c, x in chosen if x == f]
+            if won:
+                k = sum(1 for c in won if (c, m) in best_ties)
+                tie_note = f"   [{k} tie-broken]" if k else ""
+                print(f"  {m:<22} factor {f:>5}: {len(won):>4} concepts "
+                      f"({100 * len(won) / len(chosen):.1f}%){tie_note}")
+        ties = [t for (c, mm), t in best_ties.items() if mm == m]
+        zero = sum(1 for t in ties if t["rating"] == 0)
+        print(f"  {m:<22} tie-broken  : {len(ties):>4} concepts "
+              f"({100 * len(ties) / max(len(chosen), 1):.1f}%) -- {zero} rated 0 at every "
+              f"factor (never steered), {len(ties) - zero} tied at a positive rating")
 
     print("\n" + "-" * 58)
     print("PHASE 2: HELD-OUT SCORE (best factor per concept, scored on steering_test)")
@@ -334,11 +351,16 @@ def main():
             'help': 'Worker threads issuing judge calls in parallel. The work is '
                     'API-latency bound, so raise this to go faster and lower it if '
                     'the account starts returning 429s.'}},
+        {'args': ['--eval_models'], 'kwargs': {
+            'type': str, 'default': 'all',
+            'help': "Comma-separated steering methods to judge, e.g. "
+                    "'MeanTokenDiffMean,DiffMeanPositionalWeighted'. 'all' = every "
+                    "model in the yaml's evaluate.models."}},
     ]
     args = EvalArgs(custom_args=custom_args, section="evaluate", ignore_unknown=True)
     for name, default in (("mode", "select_best"), ("factors", "all"),
                           ("examples_per_concept", "all"), ("max_concepts", "all"),
-                          ("num_workers", 50)):
+                          ("num_workers", 50), ("eval_models", "all")):
         if not hasattr(args, name):
             setattr(args, name, default)
     args.examples_per_concept = opt_int(args.examples_per_concept)
@@ -355,6 +377,15 @@ def main():
     df_all = pd.read_parquet(data_dir / "steering_data.parquet")
     factors = parse_factors(args.factors, df_all["factor"].unique())
     models = [m for m in args.models]
+    if args.eval_models != "all":
+        requested = [m.strip() for m in args.eval_models.split(",") if m.strip()]
+        unknown = [m for m in requested if m not in models]
+        if unknown:
+            raise SystemExit(f"--eval_models {unknown} not in the yaml's evaluate.models {models}")
+        models = requested
+    missing_cols = [m for m in models if f"{m}_steered_generation" not in df_all.columns]
+    if missing_cols:
+        raise SystemExit(f"no generations for {missing_cols} in {data_dir / 'steering_data.parquet'}")
     winrate_split_ratio = getattr(args, "winrate_split_ratio", None)
 
     evaluator_class = getattr(axbench, "LMJudgeEvaluator")
@@ -410,7 +441,10 @@ def main():
             # Best factor per (concept, model), straight from phase 1's own per-task
             # results -- the same argmax evaluate.py's get_best_factors() computes but
             # never wires into steering_test.
-            best_factor = {}
+            # list.index(max) breaks ties toward the first (smallest) factor, so a
+            # concept rated 0 at every factor "picks" the smallest one. best_ties records
+            # every factor that shares the max, so the report can separate those.
+            best_factor, best_ties = {}, {}
             for entry in per_concept_eval:
                 c = entry["concept_id"]
                 for m in models:
@@ -420,6 +454,9 @@ def main():
                     lj = entry["models"][m]["lm_judge_rating"]
                     if fr:
                         best_factor[(c, m)] = fr[lj.index(max(lj))]
+                        tied = [f for f, r in zip(fr, lj) if math.isclose(r, max(lj), abs_tol=1e-9)]
+                        if len(tied) > 1:
+                            best_ties[(c, m)] = {"factors": tied, "rating": max(lj)}
 
             df_test, concept_ids_test = select_rows(
                 df_all, "steering_test", winrate_split_ratio, factors,
@@ -446,11 +483,14 @@ def main():
                     "models": models,
                     "best_factor_per_concept_model": {
                         f"{c}:{m}": f for (c, m), f in best_factor.items()},
+                    "best_factor_ties": {
+                        f"{c}:{m}": t for (c, m), t in best_ties.items()},
                     "summary_steering": summary_eval,
                     "summary_steering_test": summary_test,
                 }, f, indent=2)
 
-            print_select_best_report(summary_eval, summary_test, best_factor, models, factors)
+            print_select_best_report(summary_eval, summary_test, best_factor, models, factors,
+                                     best_ties)
             print(f"steering detail      : {dump_dir / 'steering_subset.json'}")
             print(f"steering_test detail : {dump_dir / 'steering_test_subset.json'}")
             print(f"summary               : {summary_path}")
@@ -460,6 +500,9 @@ def main():
 
     total_price = sum(lm.stats.get_total_price() for _, lm in open_clients)
     print(f"\ntotal price      : ${total_price:.2f}  ({len(open_clients)} worker client(s))")
+
+    for path in build_previews(dump_dir, data_dir):
+        print(f"preview          : {path}")
 
 
 if __name__ == "__main__":

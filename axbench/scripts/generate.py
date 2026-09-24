@@ -6,6 +6,10 @@
 # example launch command:
 #    python axbench/scripts/generate.py --config axbench/demo/sweep/generate.yaml
 
+import warnings
+warnings.filterwarnings("ignore", message=r"pyreft not installed.*")
+warnings.filterwarnings("ignore", message=r"HyperSteer unavailable.*")
+
 import shutil
 import sys
 import argparse
@@ -237,9 +241,13 @@ def save_preview(dump_dir, partition):
         negatives = rows[rows["category"] == "negative"]
         # create_train_df emits each negative in the same order as the positive it edits
         pairs = [
-            {"positive": positive, "negative": negative, "contrast_concept": contrast_concept}
-            for positive, negative, contrast_concept in zip(
-                positives["input"], negatives["input"], negatives["contrast_concept"])
+            {
+                "base_instruction": base_instruction, "positive": positive,
+                "negative": negative, "contrast_concept": contrast_concept,
+            }
+            for base_instruction, positive, negative, contrast_concept in zip(
+                positives["base_instruction"], positives["input"], negatives["input"],
+                negatives["contrast_concept"])
         ][:PREVIEW_PAIRS]
         preview.append({
             "concept_id": int(concept_id),
@@ -291,20 +299,30 @@ def sae_index(ref):
 
 
 def select_text_concepts(all_concepts, all_refs, max_concepts, seed,
-                         seed_concepts_dir, dataset_factory, dump_dir):
+                         seed_concepts_dir, dataset_factory, dump_dir,
+                         concept16k_dir=None):
     """
     Pick the text-genre concepts to generate for: up to max_concepts of them.
 
     Text concepts from seed_concepts_dir (a prior run's generate/ dir, e.g. concept500)
-    come first, in their original order and with the genres that run recorded. The rest
-    are filled from a seeded shuffle of the full concept pool, genre-classified in
-    batches until max_concepts text concepts are found. Every seed concept is excluded
-    from the fill whatever its genre, so the seed run's verdict stands -- re-asking the
-    genre model could flip a code concept to text.
+    come first, in their original order and with the genres that run recorded. Every
+    seed concept is excluded from every later fill whatever its genre, so the seed
+    run's verdict stands -- re-asking the genre model could flip a code concept to text.
 
-    Genre labels come from a temperature-1.0 LLM call, so the choice is written to
-    SELECTED_CONCEPTS_FILE once and reloaded on every later run; recomputing it on a
-    resume could hand back a different concept list than the one already half-generated.
+    If more are still needed, concept16k_dir (a concept16k split's generate/ dir) fills
+    the shortfall next: its concepts are already genre-labeled by the same pipeline, so
+    no LLM call is needed, just a filter to genre "text" and exclusion of anything
+    already taken from the seed. The sample is drawn with a fixed seed (42), independent
+    of this run's own seed, so the concept16k fill is reproducible across runs.
+
+    Only if concept16k_dir is absent, or still can't cover the shortfall, does the old
+    fallback run: a seeded shuffle of the full concept pool, genre-classified via LLM in
+    batches until max_concepts text concepts are found.
+
+    Genre labels for the LLM-classified fallback come from a temperature-1.0 call, so
+    the choice is written to SELECTED_CONCEPTS_FILE once and reloaded on every later
+    run; recomputing it on a resume could hand back a different concept list than the
+    one already half-generated.
     """
     path = os.path.join(dump_dir, SELECTED_CONCEPTS_FILE)
     if os.path.exists(path):
@@ -325,6 +343,31 @@ def select_text_concepts(all_concepts, all_refs, max_concepts, seed,
         logger.warning(
             f"{len(selected)} text concepts taken from {seed_concepts_dir} "
             f"({len(taken)} seed concepts excluded from the random fill).")
+
+    if concept16k_dir and (max_concepts is None or len(selected) < max_concepts):
+        n_before = len(selected)
+        candidates = []
+        for row in load_metadata_flatten(concept16k_dir):
+            concept, genres = row["concept"], row["concept_genres_map"][row["concept"]]
+            if concept in taken or row["ref"] in taken_refs:
+                continue
+            if genres[0] != "text":
+                continue
+            candidates.append((concept, row["ref"], genres))
+        # Fixed seed (42), independent of this run's own seed, so the concept16k fill
+        # is reproducible across runs regardless of --seed.
+        random.Random(42).shuffle(candidates)
+        n_needed = None if max_concepts is None else max_concepts - len(selected)
+        for concept, ref, genres in candidates:
+            if n_needed is not None and len(selected) - n_before >= n_needed:
+                break
+            taken.add(concept)
+            taken_refs.add(ref)
+            selected.append({"concept": concept, "ref": ref,
+                             "genres": genres, "source": "concept16k"})
+        logger.warning(
+            f"{len(selected) - n_before} text concepts taken from {concept16k_dir} "
+            f"({len(candidates)} eligible after excluding seed concepts).")
 
     # Same seeded shuffle of the full pool that the old slice-then-filter code used, so
     # with a concept500 seed the fill continues where concept500's own sample stopped.
@@ -363,19 +406,23 @@ def select_text_concepts(all_concepts, all_refs, max_concepts, seed,
         entry["concept_id"] = concept_id
         entry["sae_index"] = sae_index(entry["ref"])
     n_seed = sum(e["source"] == "seed" for e in selected)
+    n_concept16k = sum(e["source"] == "concept16k" for e in selected)
+    n_random = len(selected) - n_seed - n_concept16k
     with open(path, "w") as f:
         json.dump({
             "max_concepts": max_concepts,
             "seed": seed,
             "seed_concepts_dir": seed_concepts_dir,
+            "concept16k_dir": concept16k_dir,
             "n_from_seed": n_seed,
-            "n_random": len(selected) - n_seed,
+            "n_from_concept16k": n_concept16k,
+            "n_random": n_random,
             "n_genre_classified": n_classified,
             "concepts": selected,
         }, f, indent=2, ensure_ascii=False)
     logger.warning(
-        f"Selected {len(selected)} text concepts ({n_seed} from seed, "
-        f"{len(selected) - n_seed} random after classifying {n_classified}); wrote {path}.")
+        f"Selected {len(selected)} text concepts ({n_seed} from seed, {n_concept16k} from "
+        f"concept16k, {n_random} random after classifying {n_classified}); wrote {path}.")
     return selected
 
 
@@ -641,10 +688,16 @@ def generate_training(args, generate_args):
     # The one base-instruction pool every concept and every later stage builds on.
     base_instructions = load_or_create_base_instructions(
         dump_dir, dataset_factory.seed_instructions, num_base_instructions)
+    # Held-out pool too, always: it costs no API calls, and writing it here means
+    # flipping the inference config's steering_instructions_dist to "test" later never
+    # requires regenerating, and the two pools cannot drift apart.
+    load_or_create_base_instructions(
+        dump_dir, dataset_factory.seed_instructions, num_base_instructions, dist="test")
 
     selected = select_text_concepts(
         all_concepts, all_refs, max_concepts, args.seed,
-        getattr(args, "seed_concepts_dir", None), dataset_factory, str(dump_dir))
+        getattr(args, "seed_concepts_dir", None), dataset_factory, str(dump_dir),
+        concept16k_dir=getattr(args, "concept16k_dir", None))
     concepts = [(e["concept"], e["ref"]) for e in selected]
     concept_genres_map = {e["concept"]: e["genres"] for e in selected}
     if start_concept_id >= len(concepts):
